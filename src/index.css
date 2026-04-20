@@ -1,0 +1,145 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* SpaceDM theme — dark by default, light via [data-theme='light'] */
+:root,
+[data-theme="dark"] {
+  --bg-primary: #2d2d2d;
+  --bg-secondary: #3a3a3a;
+  --bg-tertiary: #444444;
+  --bg-hover: #4e4e4e;
+  --bg-active: #585858;
+  --border: #4a4a4a;
+  --border-subtle: #383838;
+  --text-primary: #e0e0e0;
+  --text-secondary: #a8a8a8;
+  --text-muted: #727272;
+  --accent: #0d9488;
+  --accent-hover: #14b8a6;
+  --accent-strong: #0f766e;
+  --accent-glow: rgba(13, 148, 136, 0.25);
+  --success: #00cec9;
+  --warning: #fdcb6e;
+  --danger: #ff6b6b;
+  --canvas-bg-1: #353535;
+  --canvas-bg-2: #2a2a2a;
+  --grid-dot: #4a4a4a;
+}
+
+[data-theme="light"] {
+  --bg-primary: #f9f6f0;
+  --bg-secondary: #faf8f3;
+  --bg-tertiary: #f0ede7;
+  --bg-hover: #eae7e0;
+  --bg-active: #e0ddd6;
+  --border: #ddd9d2;
+  --border-subtle: #e8e5de;
+  --text-primary: #2c2a27;
+  --text-secondary: #5a5754;
+  --text-muted: #9a9792;
+  --accent: #0d9488;
+  --accent-hover: #0f766e;
+  --accent-strong: #115e59;
+  --accent-glow: rgba(13, 148, 136, 0.15);
+  --success: #00b894;
+  --warning: #d68910;
+  --danger: #c0392b;
+  --canvas-bg-1: #ece8df;
+  --canvas-bg-2: #f4f1ea;
+  --grid-dot: #cfcabf;
+}
+
+@layer base {
+  html, body, #root {
+    height: 100%;
+    margin: 0;
+  }
+  body {
+    font-family: Outfit, -apple-system, BlinkMacSystemFont, ui-sans-serif, system-ui, sans-serif;
+    font-size: 13px;
+    line-height: 18px;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    overflow: hidden;
+  }
+  .font-heading {
+    font-family: Syne, Outfit, ui-sans-serif, system-ui, sans-serif;
+  }
+}
+
+@layer components {
+  .toolbar-btn {
+    @apply w-9 h-9 grid place-items-center rounded-md transition-colors;
+    color: var(--text-secondary);
+  }
+  .toolbar-btn:hover {
+    background: var(--bg-hover);
+    color: var(--text-primary);
+  }
+  .toolbar-btn-active {
+    background: var(--accent) !important;
+    color: #fff !important;
+    box-shadow: 0 0 0 3px var(--accent-glow);
+  }
+  .top-tab {
+    @apply px-3 py-1.5 text-sm rounded-md transition-colors;
+    color: var(--text-secondary);
+  }
+  .top-tab:hover {
+    color: var(--text-primary);
+  }
+  .top-tab-active {
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+  }
+  .icon-btn {
+    @apply w-8 h-8 grid place-items-center rounded-md transition-colors;
+    color: var(--text-secondary);
+  }
+  .icon-btn:hover {
+    background: var(--bg-hover);
+    color: var(--text-primary);
+  }
+  .pill-btn {
+    @apply h-8 px-3 inline-flex items-center justify-center rounded-md text-sm transition-colors;
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+  }
+  .pill-btn:hover {
+    background: var(--bg-hover);
+  }
+  .pill-btn-accent {
+    background: var(--accent) !important;
+    color: #fff !important;
+  }
+  .pill-btn-accent:hover {
+    background: var(--accent-hover) !important;
+  }
+  .panel {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+  }
+  .row-selected {
+    background: color-mix(in srgb, var(--accent) 18%, transparent);
+    color: var(--text-primary);
+  }
+  .row-active {
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    color: var(--text-primary);
+  }
+  .overlay-bg {
+    background: color-mix(in srgb, var(--bg-primary) 92%, transparent);
+  }
+  .surface-2 {
+    background: color-mix(in srgb, var(--bg-tertiary) 75%, transparent);
+  }
+  .scroll-thin::-webkit-scrollbar { width: 8px; height: 8px; }
+  .scroll-thin::-webkit-scrollbar-thumb {
+    background: var(--bg-tertiary);
+    border-radius: 999px;
+  }
+  .scroll-thin::-webkit-scrollbar-track { background: transparent; }
+}
