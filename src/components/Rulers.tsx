@@ -20,7 +20,6 @@ export function Rulers({ width, height, showH = true, showV = true }: Props) {
   const rawStep = targetPx / zoom;
   const niceStep = niceNumber(rawStep);
   const step = niceStep * zoom;
-  const subStep = step / 5;
 
   // horizontal ruler ticks
   const horizontalStartWorld = Math.floor(-pan.x / zoom / niceStep) * niceStep;

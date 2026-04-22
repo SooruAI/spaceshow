@@ -1,9 +1,10 @@
+import type Konva from "konva";
 import type { Sheet } from "../types";
 
 export type ExportFormat = "png" | "jpeg" | "pdf" | "svg";
 
 export function exportSheetAsImage(
-  stage: any,
+  stage: Konva.Stage | null,
   sheet: Sheet,
   format: "png" | "jpeg",
   zoom: number,

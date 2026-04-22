@@ -25,7 +25,7 @@ export type ThemeVars = Record<(typeof VAR_NAMES)[number], string>;
 
 function readVars(): ThemeVars {
   const cs = getComputedStyle(document.documentElement);
-  const out: any = {};
+  const out = {} as ThemeVars;
   for (const n of VAR_NAMES) out[n] = cs.getPropertyValue(n).trim() || "#000";
   return out;
 }
@@ -37,6 +37,9 @@ export function useThemeVars(): ThemeVars {
       : readVars()
   );
   useEffect(() => {
+    // Re-read vars on mount in case theme changed between SSR/initial render
+    // and client mount; subsequent updates come from the MutationObserver.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setVars(readVars());
     const obs = new MutationObserver(() => setVars(readVars()));
     obs.observe(document.documentElement, {
@@ -58,5 +61,7 @@ export function applyTheme(mode: ThemeMode) {
   document.documentElement.setAttribute("data-theme", mode);
   try {
     localStorage.setItem("spaceshow-theme", mode);
-  } catch {}
+  } catch {
+    /* no-op — storage may be unavailable (privacy mode, quota, etc.) */
+  }
 }

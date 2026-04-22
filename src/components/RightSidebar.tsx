@@ -9,7 +9,6 @@ import {
   EyeOff,
   Heart,
   Settings,
-  Magnet,
 } from "lucide-react";
 import { useStore } from "../store";
 
@@ -43,6 +42,7 @@ export function RightSidebar() {
     .filter((v) => {
       if (filter === "favorites") return v.favorite;
       if (filter === "hidden") return v.hidden;
+      if (filter === "unhidden") return !v.hidden;
       return true;
     })
     .sort((a, b) =>
@@ -96,6 +96,12 @@ export function RightSidebar() {
 
       {/* Filter tabs */}
       <div className="px-3 pt-2 pb-1 flex items-center gap-1 text-xs">
+        <FilterTab
+          label="Unhidden"
+          icon={<Eye size={12} />}
+          active={filter === "unhidden"}
+          onClick={() => setFilter("unhidden")}
+        />
         <FilterTab
           label="All"
           icon={<Eye size={12} />}
@@ -171,10 +177,6 @@ export function RightSidebar() {
         </div>
       </div>
 
-      <div className="border-t border-ink-800 p-2 flex items-center gap-2 text-xs text-ink-300">
-        <Magnet size={12} /> Snap settings
-        <span className="ml-auto text-ink-500">on</span>
-      </div>
     </div>
   );
 }

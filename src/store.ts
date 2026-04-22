@@ -1,12 +1,17 @@
 import { create } from "zustand";
 import type {
   Board,
+  EraserVariant,
   Iteration,
   Orientation,
   PaperSize,
+  PenVariant,
+  PenVariantSettings,
   Sheet,
   SheetBorder,
   Shape,
+  ShapeKind,
+  ShapeStyle,
   Tool,
   ViewItem,
 } from "./types";
@@ -14,10 +19,71 @@ import { paperToPx } from "./lib/paperSizes";
 
 const uid = (p = "id") => `${p}_${Math.random().toString(36).slice(2, 9)}`;
 
+function defaultShapeStyle(): ShapeStyle {
+  return {
+    borderEnabled: true,
+    borderWeight: 2,
+    borderColor: "#2c2a27",
+    borderStyle: "solid",
+    cornerRadius: 0,
+    fillColor: "#0d9488",
+    fillOpacity: 1,
+  };
+}
+
 const A3_LAND = paperToPx("A3", "landscape");
 const SHEET_W = A3_LAND.width;
 const SHEET_H = A3_LAND.height;
 const SHEET_GAP = 160;
+
+const MIN_SHEET_DIM = 50;
+const MAX_SHEET_DIM = 20000;
+
+// Canonicalize the row: recompute every sheet.x from accumulated widths so the
+// horizontal gap between consecutive sheets is always exactly SHEET_GAP.
+// Preserves sheets[0].x so the viewport doesn't jump when only later sheets
+// change. Forces y=0. Pure — returns a new array.
+function layoutSheetsRow(sheets: Sheet[]): Sheet[] {
+  if (sheets.length === 0) return sheets;
+  let cursor = sheets[0].x;
+  const out: Sheet[] = [];
+  for (const sh of sheets) {
+    out.push({ ...sh, x: cursor, y: 0 });
+    cursor += sh.width + SHEET_GAP;
+  }
+  return out;
+}
+
+// Clamp dims to [MIN, MAX] and round to integers. Returns null for NaN,
+// Infinity, zero, or negative inputs — callers treat null as reject + no-op.
+function validateSheetDims(
+  w: number,
+  h: number
+): { w: number; h: number } | null {
+  if (!Number.isFinite(w) || !Number.isFinite(h)) return null;
+  if (w <= 0 || h <= 0) return null;
+  return {
+    w: Math.round(Math.min(MAX_SHEET_DIM, Math.max(MIN_SHEET_DIM, w))),
+    h: Math.round(Math.min(MAX_SHEET_DIM, Math.max(MIN_SHEET_DIM, h))),
+  };
+}
+
+// Guard paperToPx: fall back to current dims on unknown size / throw / NaN.
+function resolvePaperDims(
+  size: PaperSize,
+  orientation: Orientation,
+  fallback: { width: number; height: number }
+): { width: number; height: number } {
+  if (size === "custom") return fallback;
+  try {
+    const d = paperToPx(size, orientation);
+    if (!d || !Number.isFinite(d.width) || !Number.isFinite(d.height))
+      return fallback;
+    return d;
+  } catch {
+    return fallback;
+  }
+}
 
 function nextSheetName(sheets: { name: string }[]): string {
   // Pull the integer N out of any "Sheet N" labels and use max+1.
@@ -37,9 +103,12 @@ function nextSheetName(sheets: { name: string }[]): string {
 function defaultBorder(): SheetBorder {
   return {
     weight: 0,
-    color: "#000000",
+    color: "#1A1A1A",
     style: "solid",
     sides: { top: false, right: false, bottom: false, left: false },
+    offsets: { top: 0, right: 0, bottom: 0, left: 0 },
+    opacity: 1,
+    radius: { tl: 0, tr: 0, bl: 0, br: 0 },
   };
 }
 
@@ -179,13 +248,34 @@ const defaultViews: ViewItem[] = Array.from({ length: 12 }, (_, i) => ({
   addedAt: Date.now() - i * 1000 * 60 * 60 * 24,
 }));
 
-export type Filter = "all" | "favorites" | "hidden";
+export type Filter = "all" | "unhidden" | "favorites" | "hidden";
 export type SortOrder = "asc" | "desc";
 export type GridMode = "plain" | "dots" | "lines";
+
+// History model: we snapshot only the document (sheets + shapes). Pan/zoom/UI
+// flags are not undoable by design.
+export interface HistorySnapshot {
+  sheets: Sheet[];
+  shapes: Shape[];
+}
+
+// Clipboard payload — one entry for shapes and one for sheets, kept in-memory
+// so paste works within the session. `multi` captures a mixed batch from a
+// marquee or Shift+click multi-selection so Cmd+C / Cmd+V round-trip the whole
+// set in one go.
+export interface ClipboardState {
+  shape: Shape | null;
+  sheet: { sheet: Omit<Sheet, "id">; shapes: Omit<Shape, "id" | "sheetId">[] } | null;
+  multi: {
+    shapes: Shape[];
+    sheets: { sheet: Omit<Sheet, "id">; shapes: Omit<Shape, "id" | "sheetId">[] }[];
+  } | null;
+}
 
 interface State {
   // project
   projectName: string;
+  presentationName: string;
   // canvas
   tool: Tool;
   zoom: number; // 0..4 (0%..400%)
@@ -198,6 +288,17 @@ interface State {
   activeSheetId: string;
   selectedSheetId: string | null;
   selectedShapeId: string | null;
+  /**
+   * Multi-selection from marquee. Always kept in sync with `selectedShapeId`:
+   * single-click selection sets this to `[id]`; clearing selection sets `[]`.
+   * Marquee selection is the only path that can populate more than one entry.
+   */
+  selectedShapeIds: string[];
+  /**
+   * Multi-selection of sheets. Mirrors `selectedSheetId` on single clicks;
+   * populated by Shift+click or marquee when sheets are included.
+   */
+  selectedSheetIds: string[];
   // panels
   iterations: Iteration[];
   activeIterationId: string;
@@ -211,6 +312,10 @@ interface State {
   comments: { id: string; text: string; ts: number }[];
   showComments: boolean;
   presenting: boolean;
+  showLeftSidebar: boolean;
+  showRightSidebar: boolean;
+  showShortcuts: boolean;
+  renamingSheetId: string | null;
   // settings
   showRulerH: boolean;
   showRulerV: boolean;
@@ -220,12 +325,31 @@ interface State {
   showProfile: boolean;
   // tool config (used by drawing tools)
   toolColors: Record<string, string>;
+  /** Stroke width for new line/shape drawings, in WORLD pixels. Scales with
+   *  zoom (Canva-style) — see src/lib/zoom.ts. */
   toolStrokeWidth: number;
   toolFontSize: number;
+  /** Eraser radius, in WORLD pixels. Visual cursor scales with zoom; the
+   *  hit-test uses this value directly as the world-space radius. */
   eraserSize: number;
+  // eraser sub-tool: "stroke" drags to erase pen-family strokes; "object" clicks to delete any shape
+  eraserVariant: EraserVariant;
+  // pen sub-tool ("pen" / "marker" / "highlighter") with per-variant settings
+  penVariant: PenVariant;
+  penVariants: Record<PenVariant, PenVariantSettings>;
+  // shape sub-tool — drives the next created ShapeShape
+  shapeKind: ShapeKind;
+  shapeDefaults: ShapeStyle;
+  // text-edit overlay — non-null while a shape's in-shape text is being edited
+  editingTextShapeId: string | null;
+  // clipboard + history
+  clipboard: ClipboardState;
+  past: HistorySnapshot[];
+  future: HistorySnapshot[];
 
   // actions
   setProjectName: (name: string) => void;
+  setPresentationName: (name: string) => void;
   setTool: (t: Tool) => void;
   setZoom: (z: number) => void;
   setPan: (p: { x: number; y: number }) => void;
@@ -247,6 +371,13 @@ interface State {
   setSheetMargin: (id: string, side: "top" | "right" | "bottom" | "left", value: number | undefined) => void;
   setSheetBorder: (id: string, patch: Partial<SheetBorder>) => void;
   setSheetBorderSide: (id: string, side: "top" | "right" | "bottom" | "left", on: boolean) => void;
+  /**
+   * Raw position write — bypasses layoutSheetsRow so the user's manual drag
+   * is preserved. Next add/delete/duplicate will re-flow via the row layout.
+   */
+  setSheetPosition: (id: string, x: number, y: number) => void;
+  /** Raw rotation (degrees). Normalised into [-180, 180]. */
+  setSheetRotation: (id: string, deg: number) => void;
   toggleSheetLocked: (id: string) => void;
   toggleSheetHidden: (id: string) => void;
   toggleSheetExpanded: (id: string) => void;
@@ -258,7 +389,23 @@ interface State {
   updateShape: (id: string, patch: Partial<Shape>) => void;
   deleteShape: (id: string) => void;
   toggleShapeVisible: (id: string) => void;
-  selectShape: (id: string | null) => void;
+  toggleShapeLocked: (id: string) => void;
+  /**
+   * Select a single shape. When the shape has a non-null groupId, the
+   * selection auto-expands to every sibling sharing that groupId — unless
+   * `bypassGroup` is true (Alt-click).
+   */
+  selectShape: (id: string | null, bypassGroup?: boolean) => void;
+  /**
+   * Replace the multi-selection. Also updates `selectedShapeId` to ids[0]
+   * (or null). When any id has a non-null groupId, expands to siblings
+   * (unless `bypassGroup` is true).
+   */
+  setSelectedShapeIds: (ids: string[], bypassGroup?: boolean) => void;
+  /** Replace the sheet multi-selection. Mirrors `selectedSheetId` to ids[0] (or null). */
+  setSelectedSheetIds: (ids: string[]) => void;
+  /** Move every shape in the current multi-selection by (dx, dy). */
+  moveSelectedShapesBy: (dx: number, dy: number) => void;
   setShowHamburger: (b: boolean) => void;
   setShowIterationDropdown: (b: boolean) => void;
   addComment: (text: string) => void;
@@ -276,10 +423,87 @@ interface State {
   setToolStrokeWidth: (n: number) => void;
   setToolFontSize: (n: number) => void;
   setEraserSize: (n: number) => void;
+  setEraserVariant: (v: EraserVariant) => void;
+  setPenVariant: (v: PenVariant) => void;
+  setPenVariantColor: (v: PenVariant, color: string) => void;
+  setPenVariantWeight: (v: PenVariant, weight: number) => void;
+  setPenVariantOpacity: (v: PenVariant, opacity: number) => void;
+  setShapeKind: (k: ShapeKind) => void;
+  setShapeDefaults: (patch: Partial<ShapeStyle>) => void;
+  /** Enter in-shape text-edit mode for the given shape. */
+  beginTextEdit: (id: string) => void;
+  /** Exit text-edit mode (committed=true means the textarea wrote its value). */
+  endTextEdit: () => void;
+  /** Assign a new shared groupId to every shape currently in selectedShapeIds. */
+  groupSelected: () => void;
+  /** Clear groupId on every shape currently in selectedShapeIds. */
+  ungroupSelected: () => void;
+  // UI flags
+  setShowLeftSidebar: (b: boolean) => void;
+  setShowRightSidebar: (b: boolean) => void;
+  setShowShortcuts: (b: boolean) => void;
+  startRenameSheet: (id: string) => void;
+  stopRenameSheet: () => void;
+  // clipboard (shapes & sheets)
+  copyShape: (id: string) => void;
+  cutShape: (id: string) => void;
+  pasteShape: () => void;
+  duplicateShape: (id: string) => void;
+  copySheetToClip: (id: string) => void;
+  pasteSheetFromClip: () => void;
+  /** Copy every currently-selected shape and sheet to clipboard.multi. */
+  copyMultiToClip: (shapeIds: string[], sheetIds: string[]) => void;
+  /** Paste clipboard.multi — shapes go to the active sheet with +20 offset,
+   *  sheets are appended to the row. Selects the pasted items. */
+  pasteMultiFromClip: () => void;
+  /** Rotate every shape and sheet currently in the multi-selection by `deg`. */
+  rotateSelectedBy: (deg: number) => void;
+  /** Set visibility/lock flags for the whole multi-selection at once. */
+  setMultiVisible: (visible: boolean) => void;
+  setMultiLocked: (locked: boolean) => void;
+  // history
+  beginHistoryCoalesce: (key: string) => void;
+  endHistoryCoalesce: () => void;
+  undo: () => void;
+  redo: () => void;
+}
+
+// Actions that mutate document state (sheets/shapes) are wrapped with
+// `withHistory` so they push a snapshot onto `past` and clear `future`.
+// During a coalescing gesture (e.g. a single pen stroke producing many
+// updateShape calls), only the FIRST snapshot is kept so undo rewinds the
+// whole gesture as one step.
+const HISTORY_LIMIT = 50;
+let coalesceKey: string | null = null;
+let coalesceFirstPushed = false;
+
+// Helper is module-scoped so actions defined below can close over the store
+// handle via a late-bound reference. We assign it right after create() runs.
+let storeRef: {
+  getState: () => State;
+  setState: (
+    partial:
+      | Partial<State>
+      | ((s: State) => Partial<State>)
+  ) => void;
+} | null = null;
+
+function pushHistory(): void {
+  if (!storeRef) return;
+  const s = storeRef.getState();
+  if (coalesceKey) {
+    if (coalesceFirstPushed) return;
+    coalesceFirstPushed = true;
+  }
+  const snap: HistorySnapshot = { sheets: s.sheets, shapes: s.shapes };
+  const past = [...s.past, snap];
+  if (past.length > HISTORY_LIMIT) past.shift();
+  storeRef.setState({ past, future: [] });
 }
 
 export const useStore = create<State>((set, get) => ({
   projectName: "Project_Name",
+  presentationName: "Presentation_Name",
   tool: "select",
   zoom: 0.6,
   pan: { x: 200, y: 120 },
@@ -291,6 +515,8 @@ export const useStore = create<State>((set, get) => ({
   activeSheetId: "sheet_1",
   selectedSheetId: null,
   selectedShapeId: null,
+  selectedShapeIds: [],
+  selectedSheetIds: [],
 
   iterations: defaultIterations,
   activeIterationId: "iter_1",
@@ -319,12 +545,31 @@ export const useStore = create<State>((set, get) => ({
     line: "#2c2a27",
     sticky: "#fdcb6e",
     text: "#2c2a27",
+    shape: "#0d9488",
   },
   toolStrokeWidth: 3,
   toolFontSize: 28,
   eraserSize: 20,
+  eraserVariant: "stroke",
+  penVariant: "pen",
+  penVariants: {
+    pen:         { color: "#1A73E8", weight: 4,  opacity: 1.0 },
+    marker:      { color: "#D32F2F", weight: 8,  opacity: 1.0 },
+    highlighter: { color: "#FFEB3B", weight: 20, opacity: 0.6 },
+  },
+  shapeKind: "rectangle",
+  shapeDefaults: defaultShapeStyle(),
+  editingTextShapeId: null,
+  showLeftSidebar: true,
+  showRightSidebar: true,
+  showShortcuts: false,
+  renamingSheetId: null,
+  clipboard: { shape: null, sheet: null, multi: null },
+  past: [],
+  future: [],
 
   setProjectName: (name) => set({ projectName: name }),
+  setPresentationName: (name) => set({ presentationName: name }),
   setTool: (t) => set({ tool: t }),
   setZoom: (z) => set({ zoom: Math.min(4, Math.max(0.05, z)) }),
   setPan: (p) => set({ pan: p }),
@@ -360,17 +605,19 @@ export const useStore = create<State>((set, get) => ({
       activeSheetId: id,
       expandedSheets: { ...s.expandedSheets, [id]: true },
     })),
-  selectSheet: (id) => set({ selectedSheetId: id }),
-  addSheet: () =>
+  selectSheet: (id) =>
+    set({ selectedSheetId: id, selectedSheetIds: id ? [id] : [] }),
+  setSelectedSheetIds: (ids) =>
+    set({ selectedSheetIds: ids, selectedSheetId: ids[0] ?? null }),
+  addSheet: () => {
+    pushHistory();
     set((s) => {
-      const last = s.sheets[s.sheets.length - 1];
-      const lastW = last ? last.width : SHEET_W;
       const newSheet: Sheet = {
         id: uid("sheet"),
         name: nextSheetName(s.sheets),
         width: SHEET_W,
         height: SHEET_H,
-        x: last ? last.x + lastW + SHEET_GAP : 0,
+        x: 0,
         y: 0,
         background: "#ffffff",
         paperSize: "A3",
@@ -381,23 +628,27 @@ export const useStore = create<State>((set, get) => ({
         hidden: false,
       };
       return {
-        sheets: [...s.sheets, newSheet],
+        sheets: layoutSheetsRow([...s.sheets, newSheet]),
         activeSheetId: newSheet.id,
         selectedSheetId: newSheet.id,
         expandedSheets: { ...s.expandedSheets, [newSheet.id]: true },
       };
-    }),
-  insertSheetAfter: (id) =>
+    });
+  },
+  insertSheetAfter: (id) => {
     set((s) => {
       const idx = s.sheets.findIndex((sh) => sh.id === id);
-      if (idx === -1) return {};
-      const anchor = s.sheets[idx];
+      if (idx === -1) {
+        console.warn("[insertSheetAfter] sheet not found:", id);
+        return {};
+      }
+      pushHistory();
       const newSheet: Sheet = {
         id: uid("sheet"),
         name: nextSheetName(s.sheets),
         width: SHEET_W,
         height: SHEET_H,
-        x: anchor.x + anchor.width + SHEET_GAP,
+        x: 0,
         y: 0,
         background: "#ffffff",
         paperSize: "A3",
@@ -407,55 +658,55 @@ export const useStore = create<State>((set, get) => ({
         locked: false,
         hidden: false,
       };
-      const shift = newSheet.width + SHEET_GAP;
-      const sheets = s.sheets.map((sh, i) =>
-        i > idx ? { ...sh, x: sh.x + shift } : sh
-      );
-      sheets.splice(idx + 1, 0, newSheet);
+      const arr = [...s.sheets];
+      arr.splice(idx + 1, 0, newSheet);
       return {
-        sheets,
+        sheets: layoutSheetsRow(arr),
         activeSheetId: newSheet.id,
         selectedSheetId: newSheet.id,
         expandedSheets: { ...s.expandedSheets, [newSheet.id]: true },
       };
-    }),
-  duplicateSheet: (id) =>
+    });
+  },
+  duplicateSheet: (id) => {
     set((s) => {
       const idx = s.sheets.findIndex((sh) => sh.id === id);
-      if (idx === -1) return {};
+      if (idx === -1) {
+        console.warn("[duplicateSheet] sheet not found:", id);
+        return {};
+      }
+      pushHistory();
       const src = s.sheets[idx];
       const newSheet: Sheet = {
         ...src,
         id: uid("sheet"),
         name: `${src.name} copy`,
-        x: src.x + src.width + SHEET_GAP,
+        x: 0,
       };
-      const shift = newSheet.width + SHEET_GAP;
-      const sheets = s.sheets.map((sh, i) =>
-        i > idx ? { ...sh, x: sh.x + shift } : sh
-      );
-      sheets.splice(idx + 1, 0, newSheet);
+      const arr = [...s.sheets];
+      arr.splice(idx + 1, 0, newSheet);
       // clone shapes from src into the new sheet
       const clonedShapes: Shape[] = s.shapes
         .filter((sh) => sh.sheetId === src.id)
         .map((sh) => ({ ...sh, id: uid("shape"), sheetId: newSheet.id } as Shape));
       return {
-        sheets,
+        sheets: layoutSheetsRow(arr),
         shapes: [...s.shapes, ...clonedShapes],
         activeSheetId: newSheet.id,
         selectedSheetId: newSheet.id,
         expandedSheets: { ...s.expandedSheets, [newSheet.id]: true },
       };
-    }),
-  deleteSheet: (id) =>
+    });
+  },
+  deleteSheet: (id) => {
     set((s) => {
       const idx = s.sheets.findIndex((sh) => sh.id === id);
-      if (idx === -1) return {};
-      const removed = s.sheets[idx];
-      const shift = removed.width + SHEET_GAP;
-      const sheets = s.sheets
-        .filter((sh) => sh.id !== id)
-        .map((sh, i) => (i >= idx ? { ...sh, x: sh.x - shift } : sh));
+      if (idx === -1) {
+        console.warn("[deleteSheet] sheet not found:", id);
+        return {};
+      }
+      pushHistory();
+      const sheets = layoutSheetsRow(s.sheets.filter((sh) => sh.id !== id));
       const shapes = s.shapes.filter((sh) => sh.sheetId !== id);
       const nextActive =
         s.activeSheetId === id ? sheets[0]?.id ?? "board" : s.activeSheetId;
@@ -466,75 +717,102 @@ export const useStore = create<State>((set, get) => ({
         selectedSheetId:
           s.selectedSheetId === id ? null : s.selectedSheetId,
       };
-    }),
-  renameSheet: (id, name) =>
+    });
+  },
+  renameSheet: (id, name) => {
+    pushHistory();
     set((s) => ({
       sheets: s.sheets.map((sh) =>
         sh.id === id ? { ...sh, name: name.trim() || sh.name } : sh
       ),
-    })),
-  setSheetPaperSize: (id, size, orientation) =>
+    }));
+  },
+  setSheetPaperSize: (id, size, orientation) => {
     set((s) => {
       const idx = s.sheets.findIndex((sh) => sh.id === id);
-      if (idx === -1) return {};
+      if (idx === -1) {
+        console.warn("[setSheetPaperSize] sheet not found:", id);
+        return {};
+      }
       const target = s.sheets[idx];
-      const dims =
-        size === "custom"
-          ? { width: target.width, height: target.height }
-          : paperToPx(size, orientation);
-      const oldW = target.width;
-      const newW = dims.width;
-      const dx = newW - oldW;
-      const sheets = s.sheets.map((sh, i) => {
-        if (i === idx) {
-          return {
-            ...sh,
-            paperSize: size,
-            orientation,
-            width: dims.width,
-            height: dims.height,
-          };
-        }
-        if (i > idx) return { ...sh, x: sh.x + dx };
-        return sh;
+      const raw = resolvePaperDims(size, orientation, {
+        width: target.width,
+        height: target.height,
       });
-      return { sheets };
-    }),
-  setSheetCustomSize: (id, w, h) =>
+      const ok = validateSheetDims(raw.width, raw.height);
+      if (!ok) {
+        console.warn("[setSheetPaperSize] invalid dims:", raw);
+        return {};
+      }
+      pushHistory();
+      const updated = s.sheets.map((sh, i) =>
+        i === idx
+          ? {
+              ...sh,
+              paperSize: size,
+              orientation,
+              width: ok.w,
+              height: ok.h,
+            }
+          : sh
+      );
+      return { sheets: layoutSheetsRow(updated) };
+    });
+  },
+  setSheetCustomSize: (id, w, h) => {
     set((s) => {
       const idx = s.sheets.findIndex((sh) => sh.id === id);
-      if (idx === -1) return {};
-      const target = s.sheets[idx];
-      const dx = w - target.width;
-      const sheets = s.sheets.map((sh, i) => {
-        if (i === idx)
-          return { ...sh, paperSize: "custom" as PaperSize, width: w, height: h };
-        if (i > idx) return { ...sh, x: sh.x + dx };
-        return sh;
-      });
-      return { sheets };
-    }),
-  setSheetBackground: (id, color) =>
+      if (idx === -1) {
+        console.warn("[setSheetCustomSize] sheet not found:", id);
+        return {};
+      }
+      const ok = validateSheetDims(w, h);
+      if (!ok) {
+        console.warn("[setSheetCustomSize] invalid dims:", { w, h });
+        return {};
+      }
+      pushHistory();
+      const updated = s.sheets.map((sh, i) =>
+        i === idx
+          ? {
+              ...sh,
+              paperSize: "custom" as PaperSize,
+              width: ok.w,
+              height: ok.h,
+            }
+          : sh
+      );
+      return { sheets: layoutSheetsRow(updated) };
+    });
+  },
+  setSheetBackground: (id, color) => {
+    pushHistory();
     set((s) => ({
       sheets: s.sheets.map((sh) =>
         sh.id === id ? { ...sh, background: color } : sh
       ),
-    })),
-  setSheetMargin: (id, side, value) =>
+    }));
+  },
+  setSheetMargin: (id, side, value) => {
+    pushHistory();
     set((s) => ({
       sheets: s.sheets.map((sh) =>
         sh.id === id
           ? { ...sh, margins: { ...sh.margins, [side]: value } }
           : sh
       ),
-    })),
-  setSheetBorder: (id, patch) =>
+    }));
+  },
+  setSheetBorder: (id, patch) => {
+    pushHistory();
     set((s) => ({
       sheets: s.sheets.map((sh) =>
         sh.id === id ? { ...sh, border: { ...sh.border, ...patch } } : sh
       ),
-    })),
-  setSheetBorderSide: (id, side, on) =>
+    }));
+  },
+  setSheetBorderSide: (id, side, on) => {
+    pushHistory();
     set((s) => ({
       sheets: s.sheets.map((sh) =>
         sh.id === id
@@ -547,19 +825,49 @@ export const useStore = create<State>((set, get) => ({
             }
           : sh
       ),
-    })),
-  toggleSheetLocked: (id) =>
+    }));
+  },
+  setSheetPosition: (id, x, y) => {
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+    // Deliberately does NOT call layoutSheetsRow — this write is how the user
+    // escapes the default row arrangement via a manual drag.
+    pushHistory();
+    set((s) => ({
+      sheets: s.sheets.map((sh) =>
+        sh.id === id && !sh.locked
+          ? { ...sh, x: Math.round(x), y: Math.round(y) }
+          : sh
+      ),
+    }));
+  },
+  setSheetRotation: (id, deg) => {
+    if (!Number.isFinite(deg)) return;
+    // Normalise to [-180, 180] so repeated spins don't drift to huge numbers.
+    let d = ((deg % 360) + 360) % 360;
+    if (d > 180) d -= 360;
+    pushHistory();
+    set((s) => ({
+      sheets: s.sheets.map((sh) =>
+        sh.id === id && !sh.locked ? { ...sh, rotation: d } : sh
+      ),
+    }));
+  },
+  toggleSheetLocked: (id) => {
+    pushHistory();
     set((s) => ({
       sheets: s.sheets.map((sh) =>
         sh.id === id ? { ...sh, locked: !sh.locked } : sh
       ),
-    })),
-  toggleSheetHidden: (id) =>
+    }));
+  },
+  toggleSheetHidden: (id) => {
+    pushHistory();
     set((s) => ({
       sheets: s.sheets.map((sh) =>
         sh.id === id ? { ...sh, hidden: !sh.hidden } : sh
       ),
-    })),
+    }));
+  },
   toggleSheetExpanded: (id) =>
     set((s) => ({
       expandedSheets: { ...s.expandedSheets, [id]: !s.expandedSheets[id] },
@@ -574,25 +882,96 @@ export const useStore = create<State>((set, get) => ({
         v.id === id ? { ...v, favorite: !v.favorite } : v
       ),
     })),
-  addShape: (sh) => set((s) => ({ shapes: [...s.shapes, sh] })),
-  updateShape: (id, patch) =>
+  addShape: (sh) => {
+    pushHistory();
+    set((s) => ({ shapes: [...s.shapes, sh] }));
+  },
+  updateShape: (id, patch) => {
+    pushHistory();
     set((s) => ({
       shapes: s.shapes.map((sh) =>
         sh.id === id ? ({ ...sh, ...patch } as Shape) : sh
       ),
-    })),
-  deleteShape: (id) =>
+    }));
+  },
+  deleteShape: (id) => {
+    pushHistory();
     set((s) => ({
       shapes: s.shapes.filter((sh) => sh.id !== id),
       selectedShapeId: s.selectedShapeId === id ? null : s.selectedShapeId,
-    })),
+    }));
+  },
   toggleShapeVisible: (id) =>
     set((s) => ({
       shapes: s.shapes.map((sh) =>
         sh.id === id ? ({ ...sh, visible: !sh.visible } as Shape) : sh
       ),
     })),
-  selectShape: (id) => set({ selectedShapeId: id }),
+  toggleShapeLocked: (id) =>
+    set((s) => ({
+      shapes: s.shapes.map((sh) =>
+        sh.id === id ? ({ ...sh, locked: !sh.locked } as Shape) : sh
+      ),
+    })),
+  selectShape: (id, bypassGroup) => {
+    if (!id) {
+      set({ selectedShapeId: null, selectedShapeIds: [] });
+      return;
+    }
+    const s = get();
+    const sh = s.shapes.find((x) => x.id === id);
+    if (sh && !bypassGroup && sh.groupId) {
+      const siblings = s.shapes
+        .filter((x) => x.groupId === sh.groupId && x.visible !== false)
+        .map((x) => x.id);
+      set({ selectedShapeId: id, selectedShapeIds: siblings });
+      return;
+    }
+    set({ selectedShapeId: id, selectedShapeIds: [id] });
+  },
+  setSelectedShapeIds: (ids, bypassGroup) => {
+    if (ids.length === 0) {
+      set({ selectedShapeIds: [], selectedShapeId: null });
+      return;
+    }
+    if (bypassGroup) {
+      set({ selectedShapeIds: ids, selectedShapeId: ids[0] ?? null });
+      return;
+    }
+    const s = get();
+    const groupIds = new Set<string>();
+    for (const id of ids) {
+      const sh = s.shapes.find((x) => x.id === id);
+      if (sh?.groupId) groupIds.add(sh.groupId);
+    }
+    if (groupIds.size === 0) {
+      set({ selectedShapeIds: ids, selectedShapeId: ids[0] ?? null });
+      return;
+    }
+    const expanded = new Set(ids);
+    for (const sh of s.shapes) {
+      if (sh.groupId && groupIds.has(sh.groupId) && sh.visible !== false) {
+        expanded.add(sh.id);
+      }
+    }
+    const out = Array.from(expanded);
+    set({ selectedShapeIds: out, selectedShapeId: out[0] ?? null });
+  },
+  moveSelectedShapesBy: (dx, dy) => {
+    if (!Number.isFinite(dx) || !Number.isFinite(dy)) return;
+    if (dx === 0 && dy === 0) return;
+    set((s) => {
+      const ids = new Set(s.selectedShapeIds);
+      if (ids.size === 0) return {};
+      return {
+        shapes: s.shapes.map((sh) =>
+          ids.has(sh.id) && !sh.locked
+            ? ({ ...sh, x: sh.x + dx, y: sh.y + dy } as Shape)
+            : sh
+        ),
+      };
+    });
+  },
   setShowHamburger: (b) => set({ showHamburger: b }),
   setShowIterationDropdown: (b) => set({ showIterationDropdown: b }),
   addComment: (text) =>
@@ -611,11 +990,353 @@ export const useStore = create<State>((set, get) => ({
   setToolColor: (tool, color) =>
     set((s) => ({ toolColors: { ...s.toolColors, [tool]: color } })),
   setToolStrokeWidth: (n) =>
-    set({ toolStrokeWidth: Math.max(1, Math.min(40, Math.round(n))) }),
+    set({ toolStrokeWidth: Math.max(1, Math.min(100, Math.round(n))) }),
+  setPenVariant: (v) => set({ penVariant: v }),
+  setPenVariantColor: (v, color) =>
+    set((s) => ({
+      penVariants: { ...s.penVariants, [v]: { ...s.penVariants[v], color } },
+    })),
+  setPenVariantWeight: (v, weight) =>
+    set((s) => ({
+      penVariants: {
+        ...s.penVariants,
+        [v]: {
+          ...s.penVariants[v],
+          weight: Math.max(1, Math.min(100, Math.round(weight))),
+        },
+      },
+    })),
+  setPenVariantOpacity: (v, opacity) =>
+    set((s) => ({
+      penVariants: {
+        ...s.penVariants,
+        [v]: {
+          ...s.penVariants[v],
+          opacity: Math.max(0, Math.min(1, opacity)),
+        },
+      },
+    })),
+  setShapeKind: (k) => set({ shapeKind: k }),
+  setShapeDefaults: (patch) =>
+    set((s) => ({ shapeDefaults: { ...s.shapeDefaults, ...patch } })),
+  beginTextEdit: (id) => set({ editingTextShapeId: id }),
+  endTextEdit: () => set({ editingTextShapeId: null }),
+  groupSelected: () => {
+    const s = get();
+    const ids = s.selectedShapeIds;
+    if (ids.length < 2) return;
+    pushHistory();
+    const gid = uid("group");
+    set((s2) => ({
+      shapes: s2.shapes.map((sh) =>
+        ids.includes(sh.id) ? ({ ...sh, groupId: gid } as Shape) : sh
+      ),
+    }));
+  },
+  ungroupSelected: () => {
+    const s = get();
+    const ids = s.selectedShapeIds;
+    if (ids.length === 0) return;
+    pushHistory();
+    set((s2) => ({
+      shapes: s2.shapes.map((sh) =>
+        ids.includes(sh.id) ? ({ ...sh, groupId: null } as Shape) : sh
+      ),
+    }));
+  },
   setToolFontSize: (n) =>
     set({ toolFontSize: Math.max(8, Math.min(200, Math.round(n))) }),
   setEraserSize: (n) =>
-    set({ eraserSize: Math.max(4, Math.min(100, Math.round(n))) }),
+    set({ eraserSize: Math.max(2, Math.min(400, Math.round(n))) }),
+  setEraserVariant: (v) => set({ eraserVariant: v }),
+  // UI flag setters
+  setShowLeftSidebar: (b) => set({ showLeftSidebar: b }),
+  setShowRightSidebar: (b) => set({ showRightSidebar: b }),
+  setShowShortcuts: (b) => set({ showShortcuts: b }),
+  startRenameSheet: (id) => set({ renamingSheetId: id }),
+  stopRenameSheet: () => set({ renamingSheetId: null }),
+
+  // Clipboard actions — in-memory; copy/cut never push history.
+  copyShape: (id) => {
+    const s = get();
+    const sh = s.shapes.find((x) => x.id === id);
+    if (!sh) return;
+    set({ clipboard: { ...s.clipboard, shape: { ...sh } } });
+  },
+  cutShape: (id) => {
+    const s = get();
+    const sh = s.shapes.find((x) => x.id === id);
+    if (!sh) return;
+    pushHistory();
+    set({
+      clipboard: { ...s.clipboard, shape: { ...sh } },
+      shapes: s.shapes.filter((x) => x.id !== id),
+      selectedShapeId: s.selectedShapeId === id ? null : s.selectedShapeId,
+    });
+  },
+  pasteShape: () => {
+    const s = get();
+    const src = s.clipboard.shape;
+    if (!src) return;
+    pushHistory();
+    const copy = {
+      ...src,
+      id: uid("shape"),
+      sheetId: s.activeSheetId,
+      x: src.x + 20,
+      y: src.y + 20,
+    } as Shape;
+    set({ shapes: [...s.shapes, copy], selectedShapeId: copy.id });
+  },
+  duplicateShape: (id) => {
+    const s = get();
+    const sh = s.shapes.find((x) => x.id === id);
+    if (!sh) return;
+    pushHistory();
+    const copy = {
+      ...sh,
+      id: uid("shape"),
+      x: sh.x + 20,
+      y: sh.y + 20,
+    } as Shape;
+    set({ shapes: [...s.shapes, copy], selectedShapeId: copy.id });
+  },
+  copySheetToClip: (id) => {
+    const s = get();
+    const sh = s.sheets.find((x) => x.id === id);
+    if (!sh) return;
+    const { id: _omit, ...rest } = sh;
+    const shapeTemplates = s.shapes
+      .filter((x) => x.sheetId === id)
+      .map((x) => {
+        const { id: _sid, sheetId: _shid, ...sr } = x;
+        return sr as Omit<Shape, "id" | "sheetId">;
+      });
+    set({ clipboard: { ...s.clipboard, sheet: { sheet: rest, shapes: shapeTemplates } } });
+  },
+  pasteSheetFromClip: () => {
+    const s = get();
+    const clip = s.clipboard.sheet;
+    if (!clip) return;
+    pushHistory();
+    const anchorId =
+      s.selectedSheetId ||
+      s.activeSheetId ||
+      (s.sheets.length ? s.sheets[s.sheets.length - 1].id : null);
+    if (!anchorId) return;
+    const idx = s.sheets.findIndex((sh) => sh.id === anchorId);
+    if (idx === -1) return;
+    const newSheet: Sheet = {
+      ...clip.sheet,
+      id: uid("sheet"),
+      name: nextSheetName(s.sheets),
+      x: 0,
+      y: 0,
+    };
+    const arr = [...s.sheets];
+    arr.splice(idx + 1, 0, newSheet);
+    const clonedShapes: Shape[] = clip.shapes.map((sr) => ({
+      ...(sr as Omit<Shape, "id" | "sheetId">),
+      id: uid("shape"),
+      sheetId: newSheet.id,
+    }) as Shape);
+    set({
+      sheets: layoutSheetsRow(arr),
+      shapes: [...s.shapes, ...clonedShapes],
+      activeSheetId: newSheet.id,
+      selectedSheetId: newSheet.id,
+      expandedSheets: { ...s.expandedSheets, [newSheet.id]: true },
+    });
+  },
+
+  // Multi-selection batch ops. Shortcuts and toolbar buttons call these so
+  // Cmd+C / Cmd+V / hide / lock / rotate all apply across a mixed selection
+  // of shapes and sheets atomically (single undo step).
+  copyMultiToClip: (shapeIds, sheetIds) => {
+    const s = get();
+    const shapesCopy: Shape[] = s.shapes
+      .filter((x) => shapeIds.includes(x.id))
+      .map((x) => ({ ...x } as Shape));
+    const sheetEntries: {
+      sheet: Omit<Sheet, "id">;
+      shapes: Omit<Shape, "id" | "sheetId">[];
+    }[] = [];
+    for (const sid of sheetIds) {
+      const sh = s.sheets.find((x) => x.id === sid);
+      if (!sh) continue;
+      const { id: _omit, ...rest } = sh;
+      const shapeTemplates = s.shapes
+        .filter((x) => x.sheetId === sid)
+        .map((x) => {
+          const { id: _sid, sheetId: _shid, ...sr } = x;
+          return sr as Omit<Shape, "id" | "sheetId">;
+        });
+      sheetEntries.push({ sheet: rest, shapes: shapeTemplates });
+    }
+    if (shapesCopy.length === 0 && sheetEntries.length === 0) return;
+    set({
+      clipboard: {
+        ...s.clipboard,
+        multi: { shapes: shapesCopy, sheets: sheetEntries },
+      },
+    });
+  },
+  pasteMultiFromClip: () => {
+    const s = get();
+    const clip = s.clipboard.multi;
+    if (!clip) return;
+    if (clip.shapes.length === 0 && clip.sheets.length === 0) return;
+    pushHistory();
+    // Remap each old groupId to a fresh groupId so pasted groups stay grouped
+    // but don't accidentally merge with existing on-canvas groups.
+    const groupRemap = new Map<string, string>();
+    for (const src of clip.shapes) {
+      const gid = src.groupId;
+      if (gid && !groupRemap.has(gid)) groupRemap.set(gid, uid("group"));
+    }
+    const pastedShapes: Shape[] = clip.shapes.map((src) => {
+      const oldGid = src.groupId;
+      const newGid = oldGid ? groupRemap.get(oldGid) ?? null : null;
+      return {
+        ...src,
+        id: uid("shape"),
+        sheetId: s.activeSheetId,
+        x: src.x + 20,
+        y: src.y + 20,
+        groupId: newGid,
+      } as Shape;
+    });
+    let nextSheets = [...s.sheets];
+    const sheetBornShapes: Shape[] = [];
+    const pastedSheetIds: string[] = [];
+    for (const entry of clip.sheets) {
+      const newSheet: Sheet = {
+        ...entry.sheet,
+        id: uid("sheet"),
+        name: nextSheetName(nextSheets),
+        x: 0,
+        y: 0,
+      };
+      nextSheets.push(newSheet);
+      pastedSheetIds.push(newSheet.id);
+      for (const sr of entry.shapes) {
+        sheetBornShapes.push({
+          ...(sr as Omit<Shape, "id" | "sheetId">),
+          id: uid("shape"),
+          sheetId: newSheet.id,
+        } as Shape);
+      }
+    }
+    nextSheets = layoutSheetsRow(nextSheets);
+    const newShapeIds = pastedShapes.map((x) => x.id);
+    set({
+      sheets: nextSheets,
+      shapes: [...s.shapes, ...pastedShapes, ...sheetBornShapes],
+      selectedShapeIds: newShapeIds,
+      selectedShapeId: newShapeIds[0] ?? null,
+      selectedSheetIds: pastedSheetIds,
+      selectedSheetId: pastedSheetIds[0] ?? null,
+    });
+  },
+  rotateSelectedBy: (deg) => {
+    if (!Number.isFinite(deg) || deg === 0) return;
+    const s = get();
+    if (s.selectedShapeIds.length === 0 && s.selectedSheetIds.length === 0) {
+      return;
+    }
+    pushHistory();
+    set((s2) => {
+      const shapeIds = new Set(s2.selectedShapeIds);
+      const sheetIds = new Set(s2.selectedSheetIds);
+      return {
+        shapes: s2.shapes.map((sh) =>
+          shapeIds.has(sh.id) && !sh.locked
+            ? ({ ...sh, rotation: ((sh.rotation ?? 0) + deg) } as Shape)
+            : sh
+        ),
+        sheets: s2.sheets.map((sh) => {
+          if (!sheetIds.has(sh.id) || sh.locked) return sh;
+          let d = (((sh.rotation ?? 0) + deg) % 360 + 360) % 360;
+          if (d > 180) d -= 360;
+          return { ...sh, rotation: d };
+        }),
+      };
+    });
+  },
+  setMultiVisible: (visible) => {
+    const s = get();
+    if (s.selectedShapeIds.length === 0 && s.selectedSheetIds.length === 0) {
+      return;
+    }
+    pushHistory();
+    set((s2) => {
+      const shapeIds = new Set(s2.selectedShapeIds);
+      const sheetIds = new Set(s2.selectedSheetIds);
+      return {
+        shapes: s2.shapes.map((sh) =>
+          shapeIds.has(sh.id) ? ({ ...sh, visible } as Shape) : sh
+        ),
+        sheets: s2.sheets.map((sh) =>
+          sheetIds.has(sh.id) ? { ...sh, hidden: !visible } : sh
+        ),
+      };
+    });
+  },
+  setMultiLocked: (locked) => {
+    const s = get();
+    if (s.selectedShapeIds.length === 0 && s.selectedSheetIds.length === 0) {
+      return;
+    }
+    pushHistory();
+    set((s2) => {
+      const shapeIds = new Set(s2.selectedShapeIds);
+      const sheetIds = new Set(s2.selectedSheetIds);
+      return {
+        shapes: s2.shapes.map((sh) =>
+          shapeIds.has(sh.id) ? ({ ...sh, locked } as Shape) : sh
+        ),
+        sheets: s2.sheets.map((sh) =>
+          sheetIds.has(sh.id) ? { ...sh, locked } : sh
+        ),
+      };
+    });
+  },
+
+  // History
+  beginHistoryCoalesce: (key) => {
+    coalesceKey = key;
+    coalesceFirstPushed = false;
+  },
+  endHistoryCoalesce: () => {
+    coalesceKey = null;
+    coalesceFirstPushed = false;
+  },
+  undo: () => {
+    const s = get();
+    const prev = s.past[s.past.length - 1];
+    if (!prev) return;
+    const future = [{ sheets: s.sheets, shapes: s.shapes }, ...s.future];
+    set({
+      past: s.past.slice(0, -1),
+      future,
+      sheets: prev.sheets,
+      shapes: prev.shapes,
+    });
+  },
+  redo: () => {
+    const s = get();
+    const next = s.future[0];
+    if (!next) return;
+    const past = [...s.past, { sheets: s.sheets, shapes: s.shapes }];
+    if (past.length > HISTORY_LIMIT) past.shift();
+    set({
+      past,
+      future: s.future.slice(1),
+      sheets: next.sheets,
+      shapes: next.shapes,
+    });
+  },
+
   fitAllSheets: (vw, vh) => {
     const sheets = get().sheets;
     if (!sheets.length) return;
@@ -635,5 +1356,12 @@ export const useStore = create<State>((set, get) => ({
     set({ zoom: z, pan });
   },
 }));
+
+// Late-bind the module-scoped storeRef so `pushHistory` can read the latest
+// state and commit past/future snapshots back into the store.
+storeRef = {
+  getState: () => useStore.getState(),
+  setState: (v) => useStore.setState(v),
+};
 
 export { uid, SHEET_W, SHEET_H };

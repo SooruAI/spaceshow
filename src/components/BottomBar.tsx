@@ -10,22 +10,11 @@ export function BottomBar({ viewportW, viewportH }: Props) {
   const zoom = useStore((s) => s.zoom);
   const setZoom = useStore((s) => s.setZoom);
   const fitAll = useStore((s) => s.fitAllSheets);
-  const addSheet = useStore((s) => s.addSheet);
-  const sheetsCount = useStore((s) => s.sheets.length);
 
   const pct = Math.round(zoom * 100);
 
   return (
     <div className="h-9 bg-ink-900 border-t border-ink-700 flex items-center px-3 gap-3">
-      <button
-        className="pill-btn"
-        onClick={addSheet}
-        title="Add a new sheet"
-      >
-        <Plus size={14} className="mr-1" /> Add sheet
-      </button>
-      <div className="text-xs text-ink-400">{sheetsCount} sheets</div>
-
       <div className="ml-auto flex items-center gap-2">
         <button
           className="icon-btn"
