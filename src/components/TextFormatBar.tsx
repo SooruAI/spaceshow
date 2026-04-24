@@ -1,8 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import {
   AlignCenter,
+  AlignCenterHorizontal,
+  AlignEndHorizontal,
   AlignLeft,
   AlignRight,
+  AlignStartHorizontal,
   Bold,
   ChevronDown,
   ChevronUp,
@@ -106,6 +109,7 @@ export function TextFormatBar() {
         italic: toolTextDefaults.italic,
         underline: toolTextDefaults.underline,
         align: toolTextDefaults.align,
+        verticalAlign: toolTextDefaults.verticalAlign,
         bullets: toolTextDefaults.bullets,
         indent: toolTextDefaults.indent,
         bgColor: toolTextDefaults.bgColor,
@@ -259,6 +263,34 @@ export function TextFormatBar() {
         title="Align right"
       >
         <AlignRight size={13} />
+      </ToggleBtn>
+
+      <Divider />
+
+      {/* Vertical alignment — only visible when the box is taller than the
+          wrapped text (i.e. user has manually resized via the handles). The
+          toggle still updates state in auto-fit mode so the choice persists
+          for any later resize. */}
+      <ToggleBtn
+        active={(text.verticalAlign ?? "top") === "top"}
+        onClick={() => patch({ verticalAlign: "top" })}
+        title="Align top"
+      >
+        <AlignStartHorizontal size={13} />
+      </ToggleBtn>
+      <ToggleBtn
+        active={text.verticalAlign === "middle"}
+        onClick={() => patch({ verticalAlign: "middle" })}
+        title="Align middle"
+      >
+        <AlignCenterHorizontal size={13} />
+      </ToggleBtn>
+      <ToggleBtn
+        active={text.verticalAlign === "bottom"}
+        onClick={() => patch({ verticalAlign: "bottom" })}
+        title="Align bottom"
+      >
+        <AlignEndHorizontal size={13} />
       </ToggleBtn>
 
       <Divider />

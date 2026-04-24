@@ -322,10 +322,9 @@ export function Canvas({ width, height }: Props) {
     for (const id of ids) {
       const sh = byId.get(id);
       if (!sh || sh.type !== "shape" || !sh.visible || sh.locked) continue;
-      // Text elements skip the transformer — they read as a plain text caret
-      // surface, not a resizable shape. Resizing happens via font size + the
-      // textarea wrapping naturally to its content box.
-      if (isTextElement(sh)) continue;
+      // Text elements get the transformer too: dragging a handle flips
+      // `text.autoFit = false` (see onTransformEnd) so the box stops
+      // auto-growing and word-wraps inside the user's chosen size.
       const node = stage.findOne("#" + id);
       if (node) nodes.push(node);
     }
@@ -942,6 +941,7 @@ export function Canvas({ width, height }: Props) {
           italic: toolTextDefaults.italic,
           underline: toolTextDefaults.underline,
           align: toolTextDefaults.align,
+          verticalAlign: toolTextDefaults.verticalAlign,
           bullets: toolTextDefaults.bullets,
           indent: toolTextDefaults.indent,
           bgColor: toolTextDefaults.bgColor,
@@ -1701,12 +1701,20 @@ export function Canvas({ width, height }: Props) {
                     const newY = isCenter ? node.y() - newH / 2 : node.y();
                     node.scaleX(1);
                     node.scaleY(1);
+                    // Text shapes default to auto-fit (overlay grows to match
+                    // content). The instant the user grabs a transform handle
+                    // we flip autoFit off so subsequent edits respect their
+                    // chosen box and word-wrap inside it.
+                    const textPatch = sh.text
+                      ? { text: { ...sh.text, autoFit: false } }
+                      : {};
                     updateShape(id, {
                       x: newX,
                       y: newY,
                       width: newW,
                       height: newH,
                       rotation: node.rotation(),
+                      ...textPatch,
                     } as Partial<Shape>);
                   }
                 }}
@@ -2731,6 +2739,17 @@ function LineHandles({
     adjacentAxis: "h" | "v" | "degenerate";
   } | null>(null);
 
+  // Curvature pill drag state for the curved-line midpoint handle. The
+  // pill renders at the chord midpoint (t=0.5 on the symmetric S-curve
+  // lies exactly on the chord), so its Konva position doesn't encode the
+  // current curvature. We capture startK on drag-start and add the
+  // perpendicular drag delta over L each frame.
+  const curvDragRef = useRef<{
+    startK: number;
+    startX: number;
+    startY: number;
+  } | null>(null);
+
   if (n < 4) return null;
 
   const hitR = 12 / zoom;
@@ -2876,8 +2895,12 @@ function LineHandles({
     if (routing === "curved") {
       const s = { x: pts[0], y: pts[1] };
       const e = { x: pts[n - 2], y: pts[n - 1] };
-      const curK = shape.curvature ?? 0;
-      const pos = curvatureHandlePos(s, e, curK);
+      // Render at the chord midpoint — the symmetric S-curve passes
+      // through this point at t=0.5 for any k, so the pill always sits
+      // on the visible line. Drag math is handled via a ref that
+      // captures the starting curvature (see curvDragRef).
+      const midX = (s.x + e.x) / 2;
+      const midY = (s.y + e.y) / 2;
       // Pill aligned perpendicular to the chord so it reads as a
       // "handle on the line" rather than crossing it.
       const chordAxis = segmentAxis(s, e);
@@ -2885,17 +2908,36 @@ function LineHandles({
         chordAxis === "h" ? "v" : chordAxis === "v" ? "h" : "v";
       nodes.push(handleNode({
         key: "midpoint",
-        x: pos.x,
-        y: pos.y,
+        x: midX,
+        y: midY,
         glyph: "pill",
         pillAxis,
-        onStart: () => beginCoalesce(gestureKey("midpoint")),
+        onStart: () => {
+          curvDragRef.current = {
+            startK: shape.curvature ?? 0,
+            startX: midX,
+            startY: midY,
+          };
+          beginCoalesce(gestureKey("midpoint"));
+        },
         onMove: (ev) => {
-          const k = curvatureFromHandle(s, e, {
-            x: ev.target.x(),
-            y: ev.target.y(),
-          });
+          const d = curvDragRef.current;
+          if (!d) return;
+          const dx = ev.target.x() - d.startX;
+          const dy = ev.target.y() - d.startY;
+          const cx = e.x - s.x;
+          const cy = e.y - s.y;
+          const L = Math.hypot(cx, cy);
+          if (L < EPS) return;
+          // Unit perpendicular to the chord (90° CCW).
+          const nx = -cy / L;
+          const ny = cx / L;
+          const deltaK = (dx * nx + dy * ny) / L;
+          const k = Math.max(-2, Math.min(2, d.startK + deltaK));
           updateShape(shape.id, { curvature: k } as Partial<Shape>);
+        },
+        onEnd: () => {
+          curvDragRef.current = null;
         },
       }));
     }
@@ -3456,7 +3498,7 @@ function UnifiedShapeNode({
           fontStyle={fontStyleFor(text!.bold, text!.italic)}
           textDecoration={text!.underline ? "underline" : ""}
           align={text!.align}
-          verticalAlign="middle"
+          verticalAlign={text!.verticalAlign ?? "top"}
           fill={text!.color}
           listening={false}
         />

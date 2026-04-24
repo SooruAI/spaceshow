@@ -246,6 +246,10 @@ export interface TextContent {
   italic: boolean;
   underline: boolean;
   align: "left" | "center" | "right";
+  /** Vertical alignment of text within the box. Defaults to "top". Mostly
+   *  visible when the box is taller than the wrapped content (e.g. after the
+   *  user manually resizes a text shape via the Transformer handles). */
+  verticalAlign?: "top" | "middle" | "bottom";
   bullets: ListStyle;
   /** 0..6 indent levels. */
   indent: number;
@@ -255,6 +259,10 @@ export interface TextContent {
   bulletStyle?: BulletStyle;
   /** Base number style at indent 0; undefined = "decimal". Cascades with indent. */
   numberStyle?: NumberStyle;
+  /** When true (default) the box auto-grows/shrinks to fit text during edit;
+   *  flipped to false the moment the user manually resizes via the transform
+   *  handles so we respect their explicit size and word-wrap inside it. */
+  autoFit?: boolean;
 }
 
 /** Unified shape primitive — covers all 14 design-tool kinds. */

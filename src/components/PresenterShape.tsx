@@ -264,7 +264,7 @@ function UnifiedPresenterShape({ shape }: { shape: ShapeShape }) {
           fontStyle={fontStyleFor(text!.bold, text!.italic)}
           textDecoration={text!.underline ? "underline" : ""}
           align={text!.align}
-          verticalAlign="middle"
+          verticalAlign={text!.verticalAlign ?? "top"}
           fill={text!.color}
           listening={false}
         />

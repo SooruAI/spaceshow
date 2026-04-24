@@ -73,10 +73,17 @@ function TextEditOverlayInner({ shape }: { shape: ShapeShape }) {
   const text = shape.text ?? DEFAULT_TEXT;
 
   // Auto-fit both width and height to text content. The textarea uses
-  // `wrap="off"`, so the longest line drives `scrollWidth` and Enter-driven
-  // line breaks drive `scrollHeight`. We grow/shrink the shape to match,
-  // clamped to the same minimum size `Canvas` uses for a fresh text shape.
+  // `wrap="off"` in this mode, so the longest line drives `scrollWidth` and
+  // Enter-driven line breaks drive `scrollHeight`. We grow/shrink the shape
+  // to match, clamped to the same minimum size `Canvas` uses for a fresh
+  // text shape.
+  //
+  // Skipped entirely when the user has manually resized the box (autoFit
+  // flipped to false in Canvas's onTransformEnd) — in that case the
+  // textarea wraps inside their chosen width and we leave dimensions alone.
+  const autoFit = text.autoFit !== false;
   useLayoutEffect(() => {
+    if (!autoFit) return;
     const ta = taRef.current;
     if (!ta) return;
     ta.style.height = "auto";
@@ -94,6 +101,7 @@ function TextEditOverlayInner({ shape }: { shape: ShapeShape }) {
       } as Partial<Shape>);
     }
   }, [
+    autoFit,
     value,
     text.fontSize,
     text.font,
@@ -185,6 +193,23 @@ function TextEditOverlayInner({ shape }: { shape: ShapeShape }) {
           height: shape.height,
           transform,
           transformOrigin: "0 0",
+          // Match Konva's verticalAlign in the static render so the textarea
+          // sits at the same vertical anchor inside the box. The textarea
+          // collapses to its content height (auto) so flex alignment can
+          // actually push it up/down within the surrounding box.
+          display: "flex",
+          alignItems:
+            (text.verticalAlign ?? "top") === "middle"
+              ? "center"
+              : (text.verticalAlign ?? "top") === "bottom"
+              ? "flex-end"
+              : "flex-start",
+          // Dashed edit-mode frame lives on the wrapper (full shape box) so
+          // it doesn't collapse around the textarea when vertical alignment
+          // shrinks the textarea to its content height — that would read as
+          // a stray horizontal line floating in the middle/bottom.
+          border: "1px dashed rgba(13, 148, 136, 0.7)",
+          boxSizing: "border-box",
         }}
         className="pointer-events-auto"
       >
@@ -219,7 +244,7 @@ function TextEditOverlayInner({ shape }: { shape: ShapeShape }) {
             <>
               <textarea
                 ref={taRef}
-                wrap="off"
+                wrap={autoFit ? "off" : "soft"}
                 value={value}
                 onChange={(e) => commitValue(e.target.value)}
                 onKeyDown={(e) => {
@@ -241,13 +266,18 @@ function TextEditOverlayInner({ shape }: { shape: ShapeShape }) {
                 }}
                 style={{
                   width: "100%",
-                  height: "100%",
+                  // Auto-fit mode: fill the box (which is sized to content
+                  // anyway). Manual-resize mode: collapse to content height
+                  // so the wrapping flex container can vertically align it
+                  // top/middle/bottom inside the user's larger box.
+                  height: autoFit ? "100%" : "auto",
+                  maxHeight: "100%",
                   paddingTop: 6,
                   paddingRight: 6,
                   paddingBottom: 6,
                   paddingLeft: showGutter ? baseIndent + GUTTER_WIDTH : baseIndent,
                   margin: 0,
-                  border: "1px dashed rgba(13, 148, 136, 0.7)",
+                  border: "none",
                   outline: "none",
                   background: text.bgColor ?? "transparent",
                   resize: "none",

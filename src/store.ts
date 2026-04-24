@@ -530,6 +530,7 @@ interface State {
     italic: boolean;
     underline: boolean;
     align: "left" | "center" | "right";
+    verticalAlign?: "top" | "middle" | "bottom";
     bullets: ListStyle;
     indent: number;
     bgColor?: string;
@@ -772,6 +773,7 @@ interface State {
     italic: boolean;
     underline: boolean;
     align: "left" | "center" | "right";
+    verticalAlign?: "top" | "middle" | "bottom";
     bullets: ListStyle;
     indent: number;
     bgColor?: string;
