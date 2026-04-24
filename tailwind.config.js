@@ -54,6 +54,30 @@ export default {
       transitionDuration: {
         DEFAULT: "120ms",
       },
+      keyframes: {
+        // Used by SpacePresent sheet-selection modal on mount.
+        "fade-scale-in": {
+          "0%": { opacity: "0", transform: "scale(0.96)" },
+          "100%": { opacity: "1", transform: "scale(1)" },
+        },
+        // Generic fade-in (end-of-present overlay, presenter enter/exit).
+        "fade-in": {
+          "0%": { opacity: "0" },
+          "100%": { opacity: "1" },
+        },
+        // Used when user presses Prev on the first slide — quick horizontal
+        // wobble to indicate "can't go back further".
+        shake: {
+          "0%, 100%": { transform: "translateX(0)" },
+          "20%, 60%": { transform: "translateX(-8px)" },
+          "40%, 80%": { transform: "translateX(8px)" },
+        },
+      },
+      animation: {
+        "fade-scale-in": "fade-scale-in 180ms ease-out",
+        "fade-in": "fade-in 200ms ease-out",
+        shake: "shake 320ms ease-in-out",
+      },
     },
   },
   plugins: [],

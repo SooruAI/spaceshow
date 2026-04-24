@@ -126,10 +126,27 @@
     background: color-mix(in srgb, var(--accent) 18%, transparent);
     color: var(--text-primary);
   }
+  .row-multi-selected {
+    background: color-mix(in srgb, var(--accent) 9%, transparent);
+    color: var(--text-primary);
+  }
   .row-active {
     background: color-mix(in srgb, var(--accent) 12%, transparent);
     color: var(--text-primary);
   }
+  /* Drag-reorder affordance for sidebar rows. Hover = grab; during a drag the
+     <body> gets [data-dragging] so the grabbing cursor shows everywhere and the
+     source row fades to 40% so the insertion line can breathe. */
+  [data-row-id] { cursor: grab; }
+  body[data-dragging] { cursor: grabbing !important; }
+  body[data-dragging] [data-row-id] { cursor: grabbing !important; }
+  [data-drag-source] { opacity: 0.4; }
+  /* Ruler-guide drag: while the user is pulling a guide out of (or back onto)
+     the rulers, show the axis-appropriate resize cursor sitewide. When the
+     pointer is hovering the origin ruler during a reposition, flip to
+     not-allowed so the user knows release will delete. */
+  body[data-guide-dragging] { cursor: move !important; }
+  body[data-guide-delete-hover="true"] { cursor: not-allowed !important; }
   .overlay-bg {
     background: color-mix(in srgb, var(--bg-primary) 92%, transparent);
   }
@@ -142,4 +159,88 @@
     border-radius: 999px;
   }
   .scroll-thin::-webkit-scrollbar-track { background: transparent; }
+
+  /* Slim range input used by the Line tool menu. Matches the dark/light
+     theming via CSS variables; thumb uses the accent color. */
+  .line-tool-range {
+    -webkit-appearance: none;
+    appearance: none;
+    height: 4px;
+    border-radius: 999px;
+    background: var(--bg-tertiary);
+    outline: none;
+    cursor: pointer;
+  }
+  .line-tool-range::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 12px;
+    height: 12px;
+    border-radius: 999px;
+    background: var(--accent);
+    border: 2px solid var(--bg-secondary);
+    cursor: pointer;
+    transition: transform 120ms;
+  }
+  .line-tool-range::-webkit-slider-thumb:hover {
+    transform: scale(1.15);
+  }
+  .line-tool-range::-moz-range-thumb {
+    width: 12px;
+    height: 12px;
+    border-radius: 999px;
+    background: var(--accent);
+    border: 2px solid var(--bg-secondary);
+    cursor: pointer;
+  }
+  .line-tool-range:focus-visible {
+    box-shadow: 0 0 0 3px var(--accent-glow);
+  }
+
+  /* TipTap comment editor — shared between read-only CommentCard and
+     editable RichTextInput. Tailwind's typography plugin isn't installed
+     so we roll a minimal style pass here. */
+  .tiptap-render, .tiptap-compose {
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--text-primary);
+  }
+  .tiptap-render p, .tiptap-compose p { margin: 0 0 4px; }
+  .tiptap-render p:last-child, .tiptap-compose p:last-child { margin-bottom: 0; }
+  .tiptap-render strong, .tiptap-compose strong { font-weight: 700; }
+  .tiptap-render em, .tiptap-compose em { font-style: italic; }
+  .tiptap-render u, .tiptap-compose u { text-decoration: underline; }
+  .tiptap-render s, .tiptap-compose s { text-decoration: line-through; opacity: 0.7; }
+  .tiptap-render ul, .tiptap-compose ul { list-style: disc; padding-left: 18px; margin: 2px 0; }
+  .tiptap-render ol, .tiptap-compose ol { list-style: decimal; padding-left: 18px; margin: 2px 0; }
+  .tiptap-render blockquote, .tiptap-compose blockquote {
+    margin: 4px 0;
+    padding: 2px 0 2px 8px;
+    border-left: 2px solid var(--border);
+    color: var(--text-secondary);
+    font-style: italic;
+  }
+  .tiptap-render code, .tiptap-compose code {
+    background: var(--bg-tertiary);
+    padding: 0 4px;
+    border-radius: 3px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px;
+  }
+  .tiptap-compose { min-height: 56px; }
+  .tiptap-compose:focus-within { outline: none; }
+  .tiptap-compose p.is-editor-empty:first-child::before {
+    content: attr(data-placeholder);
+    color: var(--text-muted);
+    float: left;
+    height: 0;
+    pointer-events: none;
+  }
+  .mention-chip {
+    background: color-mix(in srgb, var(--accent) 24%, transparent);
+    color: var(--text-primary);
+    border-radius: 4px;
+    padding: 0 4px;
+    font-weight: 500;
+  }
 }

@@ -14,8 +14,8 @@ const TABS_RIGHT = [{ id: "show", label: "SpaceShow" }] as const;
 
 export function TopBar() {
   const showComments = useStore((s) => s.showComments);
-  const setShowComments = useStore((s) => s.setShowComments);
-  const setPresenting = useStore((s) => s.setPresenting);
+  const openRightPanel = useStore((s) => s.openRightPanel);
+  const startPresentation = useStore((s) => s.startPresentation);
   const projectName = useStore((s) => s.projectName);
   const setProjectName = useStore((s) => s.setProjectName);
   const presentationName = useStore((s) => s.presentationName);
@@ -159,11 +159,15 @@ export function TopBar() {
         <div className="ml-auto flex items-center gap-2">
           <button
             className={`pill-btn ${showComments ? "pill-btn-accent" : ""}`}
-            onClick={() => setShowComments(!showComments)}
+            onClick={() => openRightPanel(showComments ? null : "comments")}
           >
             <MessageSquare size={14} className="mr-1.5" /> Comments
           </button>
-          <button className="pill-btn" onClick={() => setPresenting(true)}>
+          <button
+            className="pill-btn"
+            onClick={() => startPresentation()}
+            title="Present — F5"
+          >
             <Play size={14} className="mr-1.5" /> Present
           </button>
           <button className="pill-btn pill-btn-accent">

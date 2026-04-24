@@ -67,6 +67,12 @@ export function SheetToolbar() {
     if (!id) return null;
     return s.shapes.find((sh) => sh.id === id) || null;
   });
+  // Text tool has its own dedicated floating toolbar (TextFormatBar) that
+  // takes over the same screen position — don't render the generic options.
+  if (tool === "text") return null;
+  // Line tool has its own dedicated floating toolbar (LineToolMenu) with a
+  // richer config surface — don't double up with the generic options bar.
+  if (tool === "line") return null;
   if (tool !== "select") return <ToolOptionsBar />;
   if (selectedShape && selectedShape.type === "shape")
     return <ShapeOptionsBar />;
@@ -2564,36 +2570,14 @@ function PenColorPopover({ variant }: { variant: PenVariant }) {
   const dirty =
     color.toUpperCase() !== baseline.color.toUpperCase() || opacity !== baseline.opacity;
 
-  // Refs so the unmount cleanup always sees current values. Mirrors the
-  // SheetBackgroundPopover pattern — prevents stale closure while avoiding
-  // re-registering the cleanup effect on every value change.
-  const baselineRef = useRef(baseline);
-  baselineRef.current = baseline;
-  const latestRef = useRef({ color, opacity });
-  latestRef.current = { color, opacity };
-  const setColorRef = useRef(setPenVariantColor);
-  setColorRef.current = setPenVariantColor;
-  const setOpacityRef = useRef(setPenVariantOpacity);
-  setOpacityRef.current = setPenVariantOpacity;
-  const appliedRef = useRef(false);
-
-  useEffect(() => {
-    return () => {
-      if (appliedRef.current) return;
-      const { color: bc, opacity: bo } = baselineRef.current;
-      const { color: cc, opacity: co } = latestRef.current;
-      if (cc.toUpperCase() !== bc.toUpperCase()) setColorRef.current(variant, bc);
-      if (co !== bo) setOpacityRef.current(variant, bo);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  // Closing the popover (e.g. by clicking on canvas to start drawing) is
+  // treated as an implicit commit — the live-preview value sticks. Users who
+  // want to discard pending edits must press Cancel explicitly. This fixes
+  // the bug where picking a palette swatch then drawing reverted the color
+  // back to the previously-applied value.
 
   function handleApply() {
-    appliedRef.current = true;
     setBaseline({ color, opacity });
-    setTimeout(() => {
-      appliedRef.current = false;
-    }, 0);
   }
   function handleCancel() {
     setPenVariantColor(variant, baseline.color);
@@ -3016,7 +3000,7 @@ function ToolOptionsBar() {
             className="w-24 accent-brand-500"
           />
           <span className="text-[11px] text-ink-200 tabular-nums text-right whitespace-nowrap">
-            {`${strokeWidth}px @100%`}
+            {`${strokeWidth}px`}
           </span>
         </div>
       )}
@@ -3054,7 +3038,7 @@ function ToolOptionsBar() {
             }}
             className="w-12 h-6 px-1.5 text-[11px] rounded bg-ink-700 border border-ink-700 outline-none focus:border-brand-600 text-ink-100 tabular-nums"
           />
-          <span className="text-[11px] text-ink-400 whitespace-nowrap">{"px @100%"}</span>
+          <span className="text-[11px] text-ink-400 whitespace-nowrap">px</span>
         </div>
       )}
 
@@ -3128,7 +3112,7 @@ function ToolOptionsBar() {
             className="w-24 accent-brand-500"
           />
           <span className="text-[11px] text-ink-200 tabular-nums text-right whitespace-nowrap">
-            {`${eraserSize}px @100%`}
+            {`${eraserSize}px`}
           </span>
         </div>
       )}
@@ -3248,6 +3232,7 @@ type PopoverKey =
   | "polygon";
 
 function ShapeOptionsBar() {
+  const editingTextShapeId = useStore((s) => s.editingTextShapeId);
   const shape = useStore((s) => {
     const id = s.selectedShapeId;
     if (!id) return null;
@@ -3272,6 +3257,9 @@ function ShapeOptionsBar() {
   }, [open]);
 
   if (!shape) return null;
+  // While the text-edit overlay is active, defer to TextFormatBar so the
+  // shape options bar doesn't double up at the top.
+  if (editingTextShapeId) return null;
 
   const style = shape.style;
   const isRect = shape.kind === "rectangle";

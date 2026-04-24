@@ -43,7 +43,7 @@ export function SettingsPanel() {
   return (
     <div
       ref={ref}
-      className="absolute left-60 bottom-12 z-30 w-80 panel rounded-lg shadow-2xl"
+      className="fixed left-2 bottom-11 z-30 w-80 panel rounded-lg shadow-2xl"
       style={{ background: "var(--bg-secondary)" }}
     >
       <div className="flex items-center justify-between px-3 h-9 border-b border-ink-800">

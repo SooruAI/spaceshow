@@ -8,7 +8,7 @@ import {
   Eye,
   EyeOff,
   Heart,
-  Settings,
+  PanelRightClose,
 } from "lucide-react";
 import { useStore } from "../store";
 
@@ -25,6 +25,7 @@ export function RightSidebar() {
   const sort = useStore((s) => s.viewSort);
   const setSort = useStore((s) => s.setViewSort);
   const toggleFav = useStore((s) => s.toggleViewFavorite);
+  const openRightPanel = useStore((s) => s.openRightPanel);
 
   const dropRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -53,11 +54,21 @@ export function RightSidebar() {
 
   return (
     <div className="w-72 bg-ink-900 border-l border-ink-700 flex flex-col">
-      <div className="px-3 h-9 flex items-center justify-between border-b border-ink-800 text-xs text-ink-300 uppercase tracking-wider">
-        <span>Views</span>
-        <button className="icon-btn" title="Canvas settings">
-          <Settings size={14} />
+      {/* Collapse lives on the LEFT edge (the side closest to the canvas)
+          so the click target sits where the user's cursor is already
+          headed when dismissing the panel. The "Views" label is centered
+          in the remaining space for visual balance. */}
+      <div className="relative px-2 h-9 flex items-center justify-center border-b border-ink-800 text-xs text-ink-300 uppercase tracking-wider">
+        <button
+          type="button"
+          onClick={() => openRightPanel(null)}
+          title="Collapse sidebar"
+          aria-label="Collapse sidebar"
+          className="absolute left-2 top-1/2 -translate-y-1/2 w-7 h-7 rounded-md inline-flex items-center justify-center text-ink-400 hover:text-ink-100 hover:bg-ink-800 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/60"
+        >
+          <PanelRightClose size={14} />
         </button>
+        <span>Views</span>
       </div>
 
       {/* Iteration selector */}

@@ -7,9 +7,20 @@ interface Props {
   height: number;
   showH?: boolean;
   showV?: boolean;
+  /** Called when the user presses mousedown on a ruler strip — Canvas then
+   *  takes over the drag lifecycle (window mousemove/mouseup, snap, commit).
+   *  `axis` is the axis of the guide being CREATED: "h" for horizontal
+   *  guide (dragged down from the top ruler), "v" for vertical guide. */
+  onRulerMouseDown?: (axis: "h" | "v", e: React.MouseEvent) => void;
 }
 
-export function Rulers({ width, height, showH = true, showV = true }: Props) {
+export function Rulers({
+  width,
+  height,
+  showH = true,
+  showV = true,
+  onRulerMouseDown,
+}: Props) {
   const leftOffset = showV ? RULER_SIZE : 0;
   const topOffset = showH ? RULER_SIZE : 0;
   const zoom = useStore((s) => s.zoom);
@@ -75,6 +86,13 @@ export function Rulers({ width, height, showH = true, showV = true }: Props) {
           left: leftOffset,
           right: 0,
           height: RULER_SIZE,
+          cursor: onRulerMouseDown ? "move" : undefined,
+        }}
+        onMouseDown={(e) => {
+          if (!onRulerMouseDown) return;
+          if (e.button !== 0) return; // left-click only
+          onRulerMouseDown("h", e);
+          e.preventDefault();
         }}
       >
         <svg width="100%" height={RULER_SIZE} className="block">
@@ -112,6 +130,13 @@ export function Rulers({ width, height, showH = true, showV = true }: Props) {
           top: topOffset,
           bottom: 0,
           width: RULER_SIZE,
+          cursor: onRulerMouseDown ? "move" : undefined,
+        }}
+        onMouseDown={(e) => {
+          if (!onRulerMouseDown) return;
+          if (e.button !== 0) return;
+          onRulerMouseDown("v", e);
+          e.preventDefault();
         }}
       >
         <svg width={RULER_SIZE} height="100%" className="block">

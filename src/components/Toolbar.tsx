@@ -14,6 +14,7 @@ import {
   Heart,
   Hexagon,
   Highlighter,
+  MessageSquare,
   Minus,
   MousePointer2,
   Pen,
@@ -36,6 +37,7 @@ const TOOLS: { id: Tool; label: string; icon: React.ReactNode }[] = [
   { id: "line", label: "Line (L)", icon: <Minus size={16} /> },
   { id: "sticky", label: "Sticky note (S)", icon: <StickyNote size={16} /> },
   { id: "text", label: "Text (T)", icon: <Type size={16} /> },
+  { id: "comment", label: "Comment (C)", icon: <MessageSquare size={16} /> },
   { id: "upload", label: "Upload file (U)", icon: <Upload size={16} /> },
 ];
 

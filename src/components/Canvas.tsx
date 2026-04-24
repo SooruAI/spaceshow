@@ -19,6 +19,21 @@ import type Konva from "konva";
 import type { KonvaEventObject } from "konva/lib/Node";
 import { KIND_RENDERER, shapePathFor } from "../lib/shapePaths";
 import {
+  EPS,
+  computeElbowPath,
+  computeCurvedPath,
+  curvatureHandlePos,
+  curvatureFromHandle,
+  segmentAxis,
+  segmentsFromPolyline,
+  translateSegmentPerpendicular,
+  insertSegmentAtEndpoint,
+  canonicalizeOrthogonalPolyline,
+  expandLegacyElbowToPolyline,
+  buildRoundedElbowPath,
+  roundedElbowVisibleSegments,
+} from "../lib/lineRouting";
+import {
   Plus,
   Lock,
   Unlock,
@@ -38,11 +53,16 @@ import {
   MAX_ERASER_SCREEN_PX,
 } from "../lib/zoom";
 import { Rulers, RULER_SIZE } from "./Rulers";
+import { GuideLayer } from "./GuideLayer";
+import { CommentPinLayer } from "./comments/CommentPinLayer";
+import { collectSnapPoints, snapValue, type SnapKind } from "../lib/snap";
+import { formatListLines } from "../lib/listFormat";
 import { useStore, uid } from "../store";
 import { useThemeVars } from "../theme";
 import type {
   EraseMark,
   ImageShape,
+  LineShape,
   LineStyle,
   PenShape,
   PenVariant,
@@ -63,6 +83,20 @@ import type {
  * uses a fixed radius, stroke-eraser uses eraserSize/2 directly in world
  * units (eraserSize is stored in world units — see src/lib/zoom.ts).
  */
+// A text element is a transparent, borderless rectangle that exists purely to
+// hold a TextContent block. It should not behave like a generic shape — no
+// resize handles, no border framing — so the typing experience reads as plain
+// text on the canvas.
+function isTextElement(sh: Shape): boolean {
+  return (
+    sh.type === "shape" &&
+    sh.kind === "rectangle" &&
+    !!sh.text &&
+    (sh.style.fillOpacity ?? 1) === 0 &&
+    !sh.style.borderEnabled
+  );
+}
+
 function polylineDistance(points: number[], x: number, y: number): number {
   let best = Infinity;
   for (let i = 0; i < points.length - 2; i += 2) {
@@ -93,6 +127,17 @@ function penCursor(variant: PenVariant, color: string): string {
       : variant === "marker"
       ? `<path d='M5 17 L15 7 L20 12 L10 22 L3 22 Z' fill='${fill}' stroke='%23111' stroke-width='1.2' stroke-linejoin='round'/>`
       : `<path d='M6 16 L16 6 L19 9 L9 19 L4 20 Z' fill='${fill}' stroke='%23111' stroke-width='1.2' stroke-linejoin='round'/>`;
+  const svg = `<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'>${body}</svg>`;
+  return `url("data:image/svg+xml;utf8,${svg}") 3 21, crosshair`;
+}
+
+function commentCursor(): string {
+  // Speech-bubble glyph tinted brand-500 (#6366f1); hotspot at bottom-left to
+  // match the pin drop point the user is clicking on.
+  const fill = "%236366f1";
+  const body =
+    `<path d='M3 4 h16 a2 2 0 0 1 2 2 v10 a2 2 0 0 1 -2 2 h-9 l-5 4 v-4 h-2 a2 2 0 0 1 -2 -2 v-10 a2 2 0 0 1 2 -2 z' ` +
+    `fill='${fill}' stroke='%23ffffff' stroke-width='1.2' stroke-linejoin='round'/>`;
   const svg = `<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'>${body}</svg>`;
   return `url("data:image/svg+xml;utf8,${svg}") 3 21, crosshair`;
 }
@@ -131,12 +176,27 @@ export function Canvas({ width, height }: Props) {
   const toolColors = useStore((s) => s.toolColors);
   const toolStrokeWidth = useStore((s) => s.toolStrokeWidth);
   const toolFontSize = useStore((s) => s.toolFontSize);
+  const toolFont = useStore((s) => s.toolFont);
+  const toolTextDefaults = useStore((s) => s.toolTextDefaults);
   const penVariant = useStore((s) => s.penVariant);
   const penVariants = useStore((s) => s.penVariants);
   const eraserVariant = useStore((s) => s.eraserVariant);
   const eraserSize = useStore((s) => s.eraserSize);
   const shapeKind = useStore((s) => s.shapeKind);
   const shapeDefaults = useStore((s) => s.shapeDefaults);
+  const lineRouting = useStore((s) => s.lineRouting);
+  const linePattern = useStore((s) => s.linePattern);
+  const lineStartMarker = useStore((s) => s.lineStartMarker);
+  const lineEndMarker = useStore((s) => s.lineEndMarker);
+  const lineOpacity = useStore((s) => s.lineOpacity);
+  // guides
+  const guides = useStore((s) => s.guides);
+  const selectedGuideId = useStore((s) => s.selectedGuideId);
+  const addGuide = useStore((s) => s.addGuide);
+  const updateGuide = useStore((s) => s.updateGuide);
+  const commitGuide = useStore((s) => s.commitGuide);
+  const deleteGuide = useStore((s) => s.deleteGuide);
+  const setSelectedGuideId = useStore((s) => s.setSelectedGuideId);
   const theme = useThemeVars();
 
   const stageRef = useRef<Konva.Stage>(null);
@@ -170,6 +230,33 @@ export function Canvas({ width, height }: Props) {
     // Last committed delta so we don't double-apply when computing new deltas.
     lastDx: number;
     lastDy: number;
+  } | null>(null);
+  // Guide drag state. One at a time: either creating a new guide (id=null)
+  // via ruler-drag, or repositioning an existing one. `preDragValue` lets
+  // commitGuide skip history pushes on no-op drags and supports Esc rollback.
+  const [draftGuide, setDraftGuide] = useState<{
+    axis: "h" | "v";
+    value: number;
+  } | null>(null);
+  // Transient snap-feedback state. Set whenever the active drag's raw world
+  // value lands within the snap threshold of a candidate (sheet edge/center,
+  // another guide, or grid). Cleared on every mousemove that misses, and by
+  // `endGuideDrag`. Drives the red-line recolor + the perpendicular tick in
+  // GuideLayer. Not persisted to the store — purely UI.
+  const [snapIndicator, setSnapIndicator] = useState<{
+    axis: "h" | "v";
+    value: number;
+    kind: SnapKind;
+  } | null>(null);
+  const [deleteHoverGuideId, setDeleteHoverGuideId] = useState<string | null>(
+    null
+  );
+  const guideDragRef = useRef<{
+    mode: "create" | "reposition";
+    id: string | null;
+    axis: "h" | "v";
+    preDragValue: number;
+    cleanup: (() => void) | null;
   } | null>(null);
   // While panning/zooming we mutate panRef/zoomRef and apply the transform to
   // Konva + HTML overlay imperatively, committing to the store only after the
@@ -235,6 +322,10 @@ export function Canvas({ width, height }: Props) {
     for (const id of ids) {
       const sh = byId.get(id);
       if (!sh || sh.type !== "shape" || !sh.visible || sh.locked) continue;
+      // Text elements skip the transformer — they read as a plain text caret
+      // surface, not a resizable shape. Resizing happens via font size + the
+      // textarea wrapping naturally to its content box.
+      if (isTextElement(sh)) continue;
       const node = stage.findOne("#" + id);
       if (node) nodes.push(node);
     }
@@ -349,6 +440,203 @@ export function Canvas({ width, height }: Props) {
   function screenToWorld(x: number, y: number) {
     return { x: (x - pan.x) / zoom, y: (y - pan.y) / zoom };
   }
+
+  // ── Guide drag helpers ────────────────────────────────────────────────
+  // Return hit-test result for the viewport-level ruler strips. Used during
+  // guide drag to either reject a ruler-create drop (released back inside
+  // the ruler) or trigger delete-by-drag-back on a reposition.
+  function rulerHit(clientX: number, clientY: number): { h: boolean; v: boolean } {
+    const stage = stageRef.current?.container();
+    if (!stage) return { h: false, v: false };
+    const r = stage.getBoundingClientRect();
+    const topOff = showRulerH ? RULER_SIZE : 0;
+    const leftOff = showRulerV ? RULER_SIZE : 0;
+    const inH =
+      showRulerH &&
+      clientY >= r.top - topOff &&
+      clientY < r.top &&
+      clientX >= r.left - leftOff &&
+      clientX < r.left + r.width;
+    const inV =
+      showRulerV &&
+      clientX >= r.left - leftOff &&
+      clientX < r.left &&
+      clientY >= r.top - topOff &&
+      clientY < r.top + r.height;
+    return { h: inH, v: inV };
+  }
+
+  // Convert a viewport client position to world coordinates using the Stage's
+  // local origin. Returns null if the stage isn't mounted yet.
+  function clientToWorld(clientX: number, clientY: number) {
+    const stage = stageRef.current?.container();
+    if (!stage) return null;
+    const r = stage.getBoundingClientRect();
+    const stageX = clientX - r.left;
+    const stageY = clientY - r.top;
+    return {
+      stageX,
+      stageY,
+      worldX: (stageX - pan.x) / zoom,
+      worldY: (stageY - pan.y) / zoom,
+    };
+  }
+
+  // Run a raw world value through the snap engine against current sheets +
+  // guides + grid. Matches the "~8 screen-px tolerance" feel across zoom by
+  // scaling the threshold with zoom.
+  function snapGuideValue(
+    axis: "h" | "v",
+    raw: number,
+    excludeGuideId?: string
+  ): { value: number; source: SnapKind | null } {
+    const candidates = collectSnapPoints(axis, sheets, guides, excludeGuideId);
+    const thresholdWorld = 8 / zoom;
+    const gg = gridMode === "plain" ? null : gridGap;
+    return snapValue(raw, candidates, thresholdWorld, gg);
+  }
+
+  // Unified teardown — called on mouseup, on Esc, and when unmounting mid-drag.
+  function endGuideDrag() {
+    const drag = guideDragRef.current;
+    if (drag?.cleanup) drag.cleanup();
+    guideDragRef.current = null;
+    setDraftGuide(null);
+    setDeleteHoverGuideId(null);
+    setSnapIndicator(null);
+    document.body.removeAttribute("data-guide-dragging");
+    document.body.removeAttribute("data-guide-delete-hover");
+  }
+
+  // Start a drag pulling a new guide out of a ruler strip. `axis` is the
+  // guide's axis (h-ruler drag creates an H guide; v-ruler creates V).
+  function startRulerDrag(axis: "h" | "v", e: React.MouseEvent) {
+    if (guideDragRef.current) return; // already dragging
+    const initial = clientToWorld(e.clientX, e.clientY);
+    if (!initial) return;
+    const rawValue = axis === "h" ? initial.worldY : initial.worldX;
+    const initialSnap = snapGuideValue(axis, rawValue);
+    setDraftGuide({ axis, value: initialSnap.value });
+    setSnapIndicator(
+      initialSnap.source
+        ? { axis, value: initialSnap.value, kind: initialSnap.source }
+        : null
+    );
+    document.body.setAttribute("data-guide-dragging", axis);
+
+    const onMove = (ev: MouseEvent) => {
+      const w = clientToWorld(ev.clientX, ev.clientY);
+      if (!w) return;
+      const raw = axis === "h" ? w.worldY : w.worldX;
+      const { value, source } = snapGuideValue(axis, raw);
+      setDraftGuide({ axis, value });
+      setSnapIndicator(source ? { axis, value, kind: source } : null);
+    };
+    const onUp = (ev: MouseEvent) => {
+      // Only commit if released INSIDE the canvas area (not back in the ruler).
+      const hit = rulerHit(ev.clientX, ev.clientY);
+      const w = clientToWorld(ev.clientX, ev.clientY);
+      const released = !hit.h && !hit.v && w !== null;
+      if (released) {
+        const raw = axis === "h" ? w!.worldY : w!.worldX;
+        addGuide(axis, snapGuideValue(axis, raw).value);
+      }
+      endGuideDrag();
+    };
+    const onKey = (ev: KeyboardEvent) => {
+      if (ev.key === "Escape") endGuideDrag();
+    };
+
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    window.addEventListener("keydown", onKey);
+    guideDragRef.current = {
+      mode: "create",
+      id: null,
+      axis,
+      preDragValue: 0,
+      cleanup: () => {
+        window.removeEventListener("mousemove", onMove);
+        window.removeEventListener("mouseup", onUp);
+        window.removeEventListener("keydown", onKey);
+      },
+    };
+  }
+
+  // Start a drag repositioning an existing guide. `id` selects the guide;
+  // on release the guide is either committed (pushHistory once) or deleted
+  // if the pointer is inside the origin ruler strip.
+  function startGuideReposition(id: string, e: MouseEvent) {
+    if (guideDragRef.current) return;
+    const guide = useStore.getState().guides.find((g) => g.id === id);
+    if (!guide) return;
+    setSelectedGuideId(id);
+    document.body.setAttribute("data-guide-dragging", guide.axis);
+
+    const onMove = (ev: MouseEvent) => {
+      const w = clientToWorld(ev.clientX, ev.clientY);
+      if (!w) return;
+      const raw = guide.axis === "h" ? w.worldY : w.worldX;
+      const { value, source } = snapGuideValue(guide.axis, raw, id);
+      updateGuide(id, value);
+      setSnapIndicator(
+        source ? { axis: guide.axis, value, kind: source } : null
+      );
+      const hit = rulerHit(ev.clientX, ev.clientY);
+      const overOrigin = guide.axis === "h" ? hit.h : hit.v;
+      setDeleteHoverGuideId(overOrigin ? id : null);
+      if (overOrigin) {
+        document.body.setAttribute("data-guide-delete-hover", "true");
+      } else {
+        document.body.removeAttribute("data-guide-delete-hover");
+      }
+    };
+    const onUp = (ev: MouseEvent) => {
+      const hit = rulerHit(ev.clientX, ev.clientY);
+      const overOrigin = guide.axis === "h" ? hit.h : hit.v;
+      if (overOrigin) {
+        deleteGuide(id);
+      } else {
+        commitGuide(id, guide.value); // preDragValue = snapshot at drag start
+      }
+      endGuideDrag();
+    };
+    const onKey = (ev: KeyboardEvent) => {
+      if (ev.key === "Escape") {
+        // Roll back to the pre-drag value without pushing history.
+        updateGuide(id, guide.value);
+        endGuideDrag();
+      }
+    };
+
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    window.addEventListener("keydown", onKey);
+    guideDragRef.current = {
+      mode: "reposition",
+      id,
+      axis: guide.axis,
+      preDragValue: guide.value,
+      cleanup: () => {
+        window.removeEventListener("mousemove", onMove);
+        window.removeEventListener("mouseup", onUp);
+        window.removeEventListener("keydown", onKey);
+      },
+    };
+    // Prevent the event from reaching Konva's Stage click logic.
+    e.preventDefault?.();
+    e.stopPropagation?.();
+  }
+
+  // Clean up any active drag on unmount.
+  useEffect(() => {
+    return () => {
+      const drag = guideDragRef.current;
+      if (drag?.cleanup) drag.cleanup();
+      document.body.removeAttribute("data-guide-dragging");
+      document.body.removeAttribute("data-guide-delete-hover");
+    };
+  }, []);
 
   function findSheetAt(wx: number, wy: number) {
     return [...sheets].reverse().find(
@@ -487,6 +775,33 @@ export function Canvas({ width, height }: Props) {
       return;
     }
 
+    // Comment tool: drop a thread pin, open the sidebar to the new thread,
+    // and revert to Select so it's a one-shot action (same ergonomics as
+    // Sticky/Text). The composer subscribes to pendingFocusThreadId so it
+    // can grab keyboard focus on mount without us routing an extra event.
+    if (tool === "comment") {
+      const targetSheet = findSheetAt(wx, wy);
+      const canvasId = targetSheet?.id ?? "board";
+      const localX = targetSheet ? wx - targetSheet.x : wx;
+      const localY = targetSheet ? wy - targetSheet.y : wy;
+      const st = useStore.getState();
+      const newThreadId = st.addThread({
+        canvasId,
+        coordinates: { x: localX, y: localY },
+      });
+      st.openRightPanel("comments");
+      st.setActiveThread(newThreadId);
+      st.setTool("select");
+      useStore.setState({ pendingFocusThreadId: newThreadId });
+      return;
+    }
+
+    // Drawing-tool branch: clear any prior selection so stale handles
+    // (e.g. a previously-selected line's endpoint/waypoint circles) don't
+    // render on top of the new shape being drawn.
+    if (useStore.getState().selectedShapeId) selectShape(null);
+    if (useStore.getState().selectedShapeIds.length) setSelectedShapeIds([]);
+
     const targetSheet = findSheetAt(wx, wy);
     const sheetId = targetSheet?.id ?? "board";
     if (targetSheet) setActiveSheet(targetSheet.id);
@@ -566,6 +881,13 @@ export function Canvas({ width, height }: Props) {
         stroke: toolColors.line,
         strokeWidth: toolStrokeWidth,
         strokeWidthUnit: "world",
+        routing: lineRouting,
+        pattern: linePattern,
+        startMarker: lineStartMarker,
+        endMarker: lineEndMarker,
+        opacity: lineOpacity,
+        elbowOrientation: "HV",
+        curvature: lineRouting === "curved" ? 0.3 : undefined,
       };
     } else if (tool === "sticky") {
       const sticky: Shape = {
@@ -587,22 +909,50 @@ export function Canvas({ width, height }: Props) {
       selectShape(sticky.id);
       return;
     } else if (tool === "text") {
-      const txt: Shape = {
+      const sz = toolFontSize;
+      const txt: ShapeShape = {
         id,
-        type: "text",
+        type: "shape",
+        kind: "rectangle",
         sheetId,
         name: "Text",
         visible: true,
         locked: false,
         x: localX,
         y: localY,
-        text: "Double-click to edit",
-        fontSize: toolFontSize,
-        fill: toolColors.text,
+        width: 240,
+        height: Math.max(40, Math.round(sz * 1.6)),
+        rotation: 0,
+        groupId: null,
+        style: {
+          borderEnabled: false,
+          borderWeight: 0,
+          borderColor: "#2c2a27",
+          borderStyle: "solid",
+          cornerRadius: 0,
+          fillColor: "#ffffff",
+          fillOpacity: 0,
+        },
+        text: {
+          text: "",
+          font: toolFont,
+          fontSize: sz,
+          color: toolColors.text,
+          bold: toolTextDefaults.bold,
+          italic: toolTextDefaults.italic,
+          underline: toolTextDefaults.underline,
+          align: toolTextDefaults.align,
+          bullets: toolTextDefaults.bullets,
+          indent: toolTextDefaults.indent,
+          bgColor: toolTextDefaults.bgColor,
+          bulletStyle: toolTextDefaults.bulletStyle,
+          numberStyle: toolTextDefaults.numberStyle,
+        },
       };
       addShape(txt);
       setTool("select");
       selectShape(txt.id);
+      useStore.getState().beginTextEdit(txt.id);
       return;
     } else if (tool === "eraser") {
       if (eraserVariant === "object") {
@@ -832,12 +1182,6 @@ export function Canvas({ width, height }: Props) {
       const h = sh.height;
       return { x: ox + sh.x, y: oy + sh.y, w, h };
     }
-    if (sh.type === "text") {
-      const fs = sh.fontSize;
-      const w = (sh.text?.length ?? 1) * fs * 0.5;
-      const h = fs * 1.2;
-      return { x: ox + sh.x, y: oy + sh.y, w, h };
-    }
     if (sh.type === "line" || sh.type === "pen") {
       const pts = sh.points;
       if (!pts || pts.length < 2) return null;
@@ -957,13 +1301,34 @@ export function Canvas({ width, height }: Props) {
       // tiny shapes -> remove
       const sh = useStore
         .getState()
-        .shapes.find((s) => s.id === drawing.id) as RectShape | ShapeShape | undefined;
+        .shapes.find((s) => s.id === drawing.id) as Shape | undefined;
       if (
         sh &&
         (sh.type === "rect" || sh.type === "shape") &&
-        (Math.abs(sh.width) < 3 || Math.abs(sh.height) < 3)
+        (Math.abs((sh as RectShape | ShapeShape).width) < 3 ||
+          Math.abs((sh as RectShape | ShapeShape).height) < 3)
       ) {
         useStore.getState().deleteShape(sh.id);
+      }
+      // Zero-length lines (single click, no drag) get cleaned up so the
+      // store doesn't accumulate invisible stubs that still render handle
+      // circles at the click point.
+      if (sh && sh.type === "line") {
+        const pts = sh.points;
+        const dx = pts[pts.length - 2] - pts[0];
+        const dy = pts[pts.length - 1] - pts[1];
+        if (Math.hypot(dx, dy) < 3) {
+          useStore.getState().deleteShape(sh.id);
+        } else if (sh.routing === "elbow" && pts.length === 4) {
+          // Canonicalize new elbow lines to the 3-vertex explicit polyline
+          // form so segment-midpoint handles can attach to discrete segments.
+          const poly = canonicalizeOrthogonalPolyline(
+            { x: pts[0], y: pts[1] },
+            { x: pts[2], y: pts[3] },
+            sh.elbowOrientation ?? "HV",
+          );
+          useStore.getState().updateShape(sh.id, { points: poly } as Partial<Shape>);
+        }
       }
       setDrawing(null);
       useStore.getState().endHistoryCoalesce();
@@ -980,6 +1345,7 @@ export function Canvas({ width, height }: Props) {
         height={height}
         showH={showRulerH}
         showV={showRulerV}
+        onRulerMouseDown={startRulerDrag}
       />
       <div
         className="absolute"
@@ -1001,6 +1367,8 @@ export function Canvas({ width, height }: Props) {
               ? eraserVariant === "stroke"
                 ? "none"
                 : "crosshair"
+              : tool === "comment"
+              ? commentCursor()
               : "crosshair",
         }}
       >
@@ -1148,15 +1516,6 @@ export function Canvas({ width, height }: Props) {
                       useStore.getState().endHistoryCoalesce();
                     }}
                   >
-                    {/* shadow */}
-                    <Rect
-                      x={4 / zoom}
-                      y={6 / zoom}
-                      width={s.width}
-                      height={s.height}
-                      fill="rgba(0,0,0,0.45)"
-                      cornerRadius={6 / zoom}
-                    />
                     {/* page */}
                     <Rect
                       width={s.width}
@@ -1231,14 +1590,19 @@ export function Canvas({ width, height }: Props) {
                           selectedShapeId === sh.id ||
                           selectedShapeIds.includes(sh.id)
                         }
+                        isDrawing={drawing?.id === sh.id}
                         onSelect={(
                           e?: KonvaEventObject<MouseEvent | TouchEvent>
                         ) => {
-                          if (tool === "select" && !s.locked)
+                          // A shape is interactable only when its parent sheet
+                          // AND the shape itself are unlocked. Locking from the
+                          // sidebar flips `sh.locked` and has to propagate here
+                          // or drag/select would still fire on locked shapes.
+                          if (tool === "select" && !s.locked && !sh.locked)
                             onShapeClickSelect(sh.id, e);
                         }}
                         onChange={(patch) => updateShape(sh.id, patch)}
-                        draggable={tool === "select" && !s.locked}
+                        draggable={tool === "select" && !s.locked && !sh.locked}
                         onGroupDragStart={() => onShapeGroupDragStart(sh.id)}
                         onGroupDragMove={(nx, ny) =>
                           onShapeGroupDragMove(sh.id, nx, ny)
@@ -1259,6 +1623,7 @@ export function Canvas({ width, height }: Props) {
                     selectedShapeId === sh.id ||
                     selectedShapeIds.includes(sh.id)
                   }
+                  isDrawing={drawing?.id === sh.id}
                   onSelect={(
                     e?: KonvaEventObject<MouseEvent | TouchEvent>
                   ) => {
@@ -1273,6 +1638,11 @@ export function Canvas({ width, height }: Props) {
                   onGroupDragEnd={onShapeGroupDragEnd}
                 />
               ))}
+              {/* Comment pins — rendered above shapes but below selection
+                  chrome so they remain visible regardless of what's
+                  currently selected. Lives inside the world <Group> so pan
+                  / zoom / sheet rotation come for free. */}
+              <CommentPinLayer zoom={zoom} />
               {/* Marquee overlay — blue semi-transparent rect while dragging. */}
               {marquee && (
                 <Rect
@@ -1340,6 +1710,31 @@ export function Canvas({ width, height }: Props) {
                     } as Partial<Shape>);
                   }
                 }}
+              />
+              {/* Ruler guides — rendered inside the world transform so they
+                  pan/zoom with content. Lives on top of shapes+transformer
+                  so the line stays visible across everything. */}
+              <GuideLayer
+                guides={guides}
+                draft={draftGuide}
+                viewportWorldBounds={{
+                  minX: -pan.x / zoom,
+                  minY: -pan.y / zoom,
+                  maxX: (stageW - pan.x) / zoom,
+                  maxY: (stageH - pan.y) / zoom,
+                }}
+                zoom={zoom}
+                selectedGuideId={selectedGuideId}
+                deleteHoverId={deleteHoverGuideId}
+                snapIndicator={snapIndicator}
+                activeRepositionId={
+                  guideDragRef.current?.mode === "reposition"
+                    ? guideDragRef.current.id
+                    : null
+                }
+                onGuideMouseDown={(id, e) =>
+                  startGuideReposition(id, e.evt as MouseEvent)
+                }
               />
             </Group>
           </Layer>
@@ -2050,6 +2445,7 @@ function GridLayer({
 function ShapeNode({
   shape,
   selected,
+  isDrawing,
   onSelect,
   onChange,
   draggable,
@@ -2059,6 +2455,12 @@ function ShapeNode({
 }: {
   shape: Shape;
   selected: boolean;
+  /** True while the user is still holding down the mouse to draw this shape.
+   *  Lines in this state render as a straight preview from start pivot to
+   *  current pivot regardless of their final `routing`; the elbow/curved
+   *  geometry snaps in on mouseup. Keeps the draw gesture from showing a
+   *  jittering corner as the mouse moves. */
+  isDrawing?: boolean;
   onSelect: (e?: KonvaEventObject<MouseEvent | TouchEvent>) => void;
   onChange: (patch: Partial<Shape>) => void;
   draggable: boolean;
@@ -2155,15 +2557,52 @@ function ShapeNode({
       shape.strokeWidthUnit === "world"
         ? (shape.strokeWidth ?? 1)
         : (shape.strokeWidth ?? 1) / zoom;
+    // During the draw gesture, force a straight preview: elbow corners and
+    // Bézier controls only snap in on mouseup. Without this, the elbow
+    // corner jumps with every mouse move and feels like a flickering Z.
+    const routing = isDrawing ? "straight" : (shape.routing ?? "straight");
+    const commonProps = {
+      stroke: shape.stroke,
+      strokeWidth: renderStrokeWidth,
+      opacity: shape.opacity ?? 1,
+      lineCap: "round" as const,
+      lineJoin: "round" as const,
+      onClick: onSelect,
+      onTap: onSelect,
+    };
+    const primary =
+      routing === "curved" && shape.points.length >= 4 ? (
+        (() => {
+          const n = shape.points.length;
+          const s = { x: shape.points[0], y: shape.points[1] };
+          const e = { x: shape.points[n - 2], y: shape.points[n - 1] };
+          const { d } = computeCurvedPath(s, e, shape.curvature ?? 0.3);
+          return <KPath data={d} {...commonProps} />;
+        })()
+      ) : routing === "elbow" ? (
+        (() => {
+          // Canva-style rounded-corner elbow. The `isDrawing` short-circuit
+          // above forces routing to "straight" during the draw gesture, so
+          // this branch only runs for finalized elbow shapes.
+          const polyline =
+            shape.points.length >= 6
+              ? shape.points
+              : computeElbowPath(
+                  shape.points,
+                  shape.elbowOrientation ?? "HV",
+                );
+          const d = buildRoundedElbowPath(polyline, 12 / zoom);
+          return <KPath data={d} {...commonProps} />;
+        })()
+      ) : (
+        <Line points={shape.points} {...commonProps} />
+      );
+    if (!selected || isDrawing) return primary;
     return (
-      <Line
-        points={shape.points}
-        stroke={shape.stroke}
-        strokeWidth={renderStrokeWidth}
-        lineCap="round"
-        onClick={onSelect}
-        onTap={onSelect}
-      />
+      <>
+        {primary}
+        <LineHandles shape={shape} zoom={zoom} accent={accent} />
+      </>
     );
   }
   if (shape.type === "sticky") {
@@ -2203,28 +2642,6 @@ function ShapeNode({
       </Group>
     );
   }
-  if (shape.type === "text") {
-    return (
-      <Text
-        x={shape.x}
-        y={shape.y}
-        text={shape.text}
-        fontSize={shape.fontSize}
-        fill={shape.fill}
-        fontStyle="500"
-        stroke={stroke}
-        strokeWidth={selected ? 0.5 : 0}
-        draggable={draggable}
-        onClick={onSelect}
-        onTap={onSelect}
-        onDragStart={handleDragStart}
-        onDragMove={handleDragMove}
-        onDragEnd={(e) =>
-          handleDragEndWith(e, { x: e.target.x(), y: e.target.y() })
-        }
-      />
-    );
-  }
   if (shape.type === "image") {
     return (
       <UrlImage
@@ -2249,6 +2666,463 @@ function ShapeNode({
  * cache is reset whenever marks or rendered style change, so new holes appear
  * live during a stroke-erase drag.
  */
+
+/**
+ * LineHandles — draggable handles for a selected LineShape.
+ *
+ * Renders as a sibling of the <Line>/<KPath>, so it lives in the same
+ * parent transform (sheet-local for shapes on a sheet, world for board
+ * shapes). All positions are in that coordinate space.
+ *
+ * Straight & curved lines show two endpoint handles (free drag) and, for
+ * curved, a curvature affordance at `chordMid + N·k·L`.
+ *
+ * Elbow lines use Canva-style segment-drag semantics:
+ *   - Each rendered segment gets a midpoint handle, axis-constrained
+ *     perpendicular to its axis.
+ *   - Dragging the first or last segment inserts a new orthogonal stub
+ *     adjacent to the endpoint so the endpoint stays anchored.
+ *   - Middle segment drags translate the segment; neighbour segments
+ *     shorten / extend along their own axes.
+ *   - Endpoint handles remain but are locked to the adjacent segment's
+ *     axis (free-axis endpoint drag with auto-inserted corner is a v2).
+ *
+ * Each drag coalesces history under a key that includes the handle id
+ * PLUS a per-gesture UUID, so rapid re-drags of the same handle always
+ * yield distinct undo steps.
+ */
+function LineHandles({
+  shape,
+  zoom,
+  accent,
+}: {
+  shape: LineShape;
+  zoom: number;
+  accent: string;
+}) {
+  const updateShape = useStore((s) => s.updateShape);
+  const routing = shape.routing ?? "straight";
+  const pts = shape.points;
+  const n = pts.length;
+
+  // Drag-gesture state for elbow segment handles. Captured on drag start so
+  // onDragMove can replay the insert/translate operation from the original
+  // polyline every frame — keeps the math idempotent regardless of how many
+  // times onDragMove fires during the gesture.
+  const segDragRef = useRef<{
+    originalPoints: number[];
+    originalMidX: number;
+    originalMidY: number;
+    axis: "h" | "v";
+    startSegIdx: number;
+    numOriginalSegs: number;
+  } | null>(null);
+
+  // Free-axis elbow endpoint drag state. The endpoint follows the pointer
+  // in any direction; each frame we rebuild the polyline from the snapshot
+  // taken at drag start, inserting one orthogonal corner if needed so the
+  // segment leading into the unchanged interior stays axis-aligned.
+  const endpointDragRef = useRef<{
+    originalPoints: number[];
+    end: "start" | "end";
+    /** Axis of the adjacent segment at drag-start. We preserve this axis
+     *  for the stub that enters the unchanged interior, so the rest of the
+     *  polyline's topology is untouched. */
+    adjacentAxis: "h" | "v" | "degenerate";
+  } | null>(null);
+
+  if (n < 4) return null;
+
+  const hitR = 12 / zoom;
+  const visR = 5 / zoom;
+  const stroke = accent || "#0d9488";
+
+  const beginCoalesce = (handleKey: string) => {
+    useStore.getState().beginHistoryCoalesce(`line-handle-${shape.id}-${handleKey}`);
+  };
+  const endCoalesce = () => {
+    useStore.getState().endHistoryCoalesce();
+  };
+  const gestureKey = (prefix: string) =>
+    `${prefix}-${typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2)}`;
+
+  // Pill visible dimensions in screen-px (pre-zoom). Long-axis 14,
+  // short-axis 6 — matches Canva's segment-midpoint grabber. Rendered
+  // fully-rounded by setting cornerRadius to half the short axis.
+  const pillLong = 14 / zoom;
+  const pillShort = 6 / zoom;
+  const pillCorner = pillShort / 2;
+
+  const handleNode = (opts: {
+    key: string;
+    x: number;
+    y: number;
+    onStart: () => void;
+    onMove: (e: KonvaEventObject<DragEvent>) => void;
+    onEnd?: () => void;
+    fill?: string;
+    /** "circle" (default) — round endpoint/corner handle.
+     *  "pill" — fully-rounded rectangle for segment-midpoint handles. */
+    glyph?: "circle" | "pill";
+    /** Orientation of the pill's long axis. Ignored for circle.
+     *  "h" = horizontal long axis, "v" = vertical long axis. */
+    pillAxis?: "h" | "v";
+  }) => {
+    const isPill = opts.glyph === "pill";
+    const pw = isPill
+      ? opts.pillAxis === "v" ? pillShort : pillLong
+      : 0;
+    const ph = isPill
+      ? opts.pillAxis === "v" ? pillLong : pillShort
+      : 0;
+    return (
+      <Group
+        key={opts.key}
+        x={opts.x}
+        y={opts.y}
+        draggable
+        onMouseDown={(e) => {
+          e.cancelBubble = true;
+        }}
+        onDragStart={(e) => {
+          e.cancelBubble = true;
+          opts.onStart();
+        }}
+        onDragMove={(e) => {
+          e.cancelBubble = true;
+          opts.onMove(e);
+        }}
+        onDragEnd={(e) => {
+          e.cancelBubble = true;
+          opts.onEnd?.();
+          endCoalesce();
+        }}
+      >
+        {isPill ? (
+          <>
+            <Rect
+              x={-hitR}
+              y={-hitR}
+              width={hitR * 2}
+              height={hitR * 2}
+              fill="rgba(0,0,0,0.001)"
+            />
+            <Rect
+              x={-pw / 2}
+              y={-ph / 2}
+              width={pw}
+              height={ph}
+              cornerRadius={pillCorner}
+              fill={opts.fill ?? "#ffffff"}
+              stroke={stroke}
+              strokeWidth={1.5 / zoom}
+              listening={false}
+            />
+          </>
+        ) : (
+          <>
+            <Circle radius={hitR} fill="rgba(0,0,0,0.001)" />
+            <Circle
+              radius={visR}
+              fill={opts.fill ?? "#ffffff"}
+              stroke={stroke}
+              strokeWidth={1.5 / zoom}
+              listening={false}
+            />
+          </>
+        )}
+      </Group>
+    );
+  };
+
+  const nodes: React.ReactNode[] = [];
+
+  // ─── Straight & curved branch ───────────────────────────────────────
+  if (routing !== "elbow") {
+    nodes.push(handleNode({
+      key: "start",
+      x: pts[0],
+      y: pts[1],
+      onStart: () => beginCoalesce(gestureKey("endpoint-start")),
+      onMove: (e) => {
+        const cur = useStore.getState().shapes.find((x) => x.id === shape.id);
+        if (!cur || cur.type !== "line") return;
+        const next = cur.points.slice();
+        next[0] = e.target.x();
+        next[1] = e.target.y();
+        updateShape(shape.id, { points: next } as Partial<Shape>);
+      },
+    }));
+    nodes.push(handleNode({
+      key: "end",
+      x: pts[n - 2],
+      y: pts[n - 1],
+      onStart: () => beginCoalesce(gestureKey("endpoint-end")),
+      onMove: (e) => {
+        const cur = useStore.getState().shapes.find((x) => x.id === shape.id);
+        if (!cur || cur.type !== "line") return;
+        const m = cur.points.length;
+        const next = cur.points.slice();
+        next[m - 2] = e.target.x();
+        next[m - 1] = e.target.y();
+        updateShape(shape.id, { points: next } as Partial<Shape>);
+      },
+    }));
+
+    // Curvature midpoint pill — curved routing only. Straight lines
+    // intentionally show *just* the two endpoints; the way to get a
+    // curve is to pick Curved from the LineToolMenu Type control, not
+    // to drag a ghost handle on the straight line.
+    if (routing === "curved") {
+      const s = { x: pts[0], y: pts[1] };
+      const e = { x: pts[n - 2], y: pts[n - 1] };
+      const curK = shape.curvature ?? 0;
+      const pos = curvatureHandlePos(s, e, curK);
+      // Pill aligned perpendicular to the chord so it reads as a
+      // "handle on the line" rather than crossing it.
+      const chordAxis = segmentAxis(s, e);
+      const pillAxis: "h" | "v" =
+        chordAxis === "h" ? "v" : chordAxis === "v" ? "h" : "v";
+      nodes.push(handleNode({
+        key: "midpoint",
+        x: pos.x,
+        y: pos.y,
+        glyph: "pill",
+        pillAxis,
+        onStart: () => beginCoalesce(gestureKey("midpoint")),
+        onMove: (ev) => {
+          const k = curvatureFromHandle(s, e, {
+            x: ev.target.x(),
+            y: ev.target.y(),
+          });
+          updateShape(shape.id, { curvature: k } as Partial<Shape>);
+        },
+      }));
+    }
+
+    return <>{nodes}</>;
+  }
+
+  // ─── Elbow branch — segment-midpoint primary affordance ────────────
+  // Derive segments from the rendered polyline so we cover the length-4
+  // legacy fallback (computeElbowPath) and the new length-≥6 explicit form.
+  const renderPts = pts.length >= 6
+    ? pts
+    : computeElbowPath(pts, shape.elbowOrientation ?? "HV");
+  const segs = segmentsFromPolyline(renderPts);
+  const numSegs = segs.length;
+
+  // Lazy-migrate legacy length-4 points to canonical length-6 polyline on
+  // the first interactive drag. Visually identical — the expanded polyline
+  // matches what computeElbowPath produced before.
+  const ensureMigrated = (): number[] => {
+    if (pts.length >= 6) return pts.slice();
+    const expanded = expandLegacyElbowToPolyline(
+      pts,
+      shape.elbowOrientation ?? "HV",
+    );
+    updateShape(shape.id, { points: expanded } as Partial<Shape>);
+    return expanded;
+  };
+
+  // Endpoint handles — axis-constrained along the adjacent segment.
+  if (numSegs > 0) {
+    const firstSeg = segs[0];
+    const firstAxis = segmentAxis(firstSeg[0], firstSeg[1]);
+    const startPt = firstSeg[0];
+    nodes.push(handleNode({
+      key: "start",
+      x: startPt.x,
+      y: startPt.y,
+      onStart: () => {
+        const migrated = ensureMigrated();
+        endpointDragRef.current = {
+          originalPoints: migrated,
+          end: "start",
+          adjacentAxis: firstAxis,
+        };
+        beginCoalesce(gestureKey("endpoint-start"));
+      },
+      onMove: (e) => {
+        const d = endpointDragRef.current;
+        if (!d) return;
+        const newX = e.target.x();
+        const newY = e.target.y();
+        const orig = d.originalPoints;
+        // B is the vertex after the dragged endpoint. The stub we may
+        // insert goes A'→Q→B, chosen so Q→B preserves the original
+        // adjacent-segment axis and the interior polyline is untouched.
+        const Bx = orig[2];
+        const By = orig[3];
+        let qx: number | null = null;
+        let qy: number | null = null;
+        if (d.adjacentAxis === "h") {
+          qx = newX;
+          qy = By;
+        } else if (d.adjacentAxis === "v") {
+          qx = Bx;
+          qy = newY;
+        }
+        let next: number[];
+        if (qx === null || qy === null) {
+          next = [newX, newY, ...orig.slice(2)];
+        } else {
+          const qEqEndpoint = Math.abs(qx - newX) < EPS && Math.abs(qy - newY) < EPS;
+          const qEqB = Math.abs(qx - Bx) < EPS && Math.abs(qy - By) < EPS;
+          if (qEqEndpoint || qEqB) {
+            next = [newX, newY, ...orig.slice(2)];
+          } else {
+            next = [newX, newY, qx, qy, ...orig.slice(2)];
+          }
+        }
+        updateShape(shape.id, { points: next } as Partial<Shape>);
+      },
+      onEnd: () => {
+        endpointDragRef.current = null;
+      },
+    }));
+
+    const lastSeg = segs[numSegs - 1];
+    const lastAxis = segmentAxis(lastSeg[0], lastSeg[1]);
+    const endPt = lastSeg[1];
+    nodes.push(handleNode({
+      key: "end",
+      x: endPt.x,
+      y: endPt.y,
+      onStart: () => {
+        const migrated = ensureMigrated();
+        endpointDragRef.current = {
+          originalPoints: migrated,
+          end: "end",
+          adjacentAxis: lastAxis,
+        };
+        beginCoalesce(gestureKey("endpoint-end"));
+      },
+      onMove: (e) => {
+        const d = endpointDragRef.current;
+        if (!d) return;
+        const newX = e.target.x();
+        const newY = e.target.y();
+        const orig = d.originalPoints;
+        const m = orig.length;
+        // P is the vertex just before the dragged endpoint (originally
+        // the last interior vertex). Stub inserted between P and new end
+        // preserves the P→Q axis so the interior polyline is untouched.
+        const Px = orig[m - 4];
+        const Py = orig[m - 3];
+        let qx: number | null = null;
+        let qy: number | null = null;
+        if (d.adjacentAxis === "h") {
+          qx = newX;
+          qy = Py;
+        } else if (d.adjacentAxis === "v") {
+          qx = Px;
+          qy = newY;
+        }
+        let next: number[];
+        if (qx === null || qy === null) {
+          next = [...orig.slice(0, m - 2), newX, newY];
+        } else {
+          const qEqEndpoint = Math.abs(qx - newX) < EPS && Math.abs(qy - newY) < EPS;
+          const qEqP = Math.abs(qx - Px) < EPS && Math.abs(qy - Py) < EPS;
+          if (qEqEndpoint || qEqP) {
+            next = [...orig.slice(0, m - 2), newX, newY];
+          } else {
+            next = [...orig.slice(0, m - 2), qx, qy, newX, newY];
+          }
+        }
+        updateShape(shape.id, { points: next } as Partial<Shape>);
+      },
+      onEnd: () => {
+        endpointDragRef.current = null;
+      },
+    }));
+  }
+
+  // Segment-midpoint handles — one per rendered segment, perpendicular drag.
+  // Position is the midpoint of the VISIBLE straight portion (segment clipped
+  // by the arc zones at rounded corners), so pills always sit on the line.
+  // Short segments whose visible portion can't contain the pill are skipped.
+  const visSegs = roundedElbowVisibleSegments(renderPts, 12 / zoom);
+  const pillMinLen = 14 / zoom;
+  segs.forEach((seg, segIdx) => {
+    const [a, b] = seg;
+    const axis = segmentAxis(a, b);
+    if (axis === "degenerate") return;
+    const vis = visSegs[segIdx];
+    if (!vis) return;
+    const [va, vb] = vis;
+    const visLen = Math.hypot(vb.x - va.x, vb.y - va.y);
+    // Hide the pill when the visible straight portion is shorter than the
+    // pill itself — otherwise the pill would extend past the rendered line
+    // into the arc zone / empty space (Canva hides the handle here too).
+    if (visLen < pillMinLen) return;
+    const midX = (va.x + vb.x) / 2;
+    const midY = (va.y + vb.y) / 2;
+
+    nodes.push(handleNode({
+      key: `seg-${segIdx}`,
+      x: midX,
+      y: midY,
+      fill: "rgba(255,255,255,0.9)",
+      glyph: "pill",
+      pillAxis: axis as "h" | "v",
+      onStart: () => {
+        // Snapshot the pre-migration polyline so onDragMove can replay
+        // the insert/translate op from a stable base regardless of how
+        // many frames the gesture spans.
+        const migrated = ensureMigrated();
+        const actualNumSegs = Math.max(0, (migrated.length - 2) / 2);
+        segDragRef.current = {
+          originalPoints: migrated,
+          originalMidX: midX,
+          originalMidY: midY,
+          axis: axis as "h" | "v",
+          startSegIdx: segIdx,
+          numOriginalSegs: actualNumSegs,
+        };
+        beginCoalesce(gestureKey(`segdrag-${segIdx}`));
+      },
+      onMove: (e) => {
+        const d = segDragRef.current;
+        if (!d) return;
+        // Lock off-axis coord visually so the handle tracks only the
+        // perpendicular drag direction.
+        if (d.axis === "h") e.target.x(d.originalMidX);
+        else e.target.y(d.originalMidY);
+        const delta = d.axis === "h"
+          ? e.target.y() - d.originalMidY
+          : e.target.x() - d.originalMidX;
+        if (Math.abs(delta) < EPS) {
+          updateShape(shape.id, { points: d.originalPoints } as Partial<Shape>);
+          return;
+        }
+        let next: number[];
+        if (d.startSegIdx === 0 && d.numOriginalSegs > 1) {
+          next = insertSegmentAtEndpoint(d.originalPoints, "start", delta);
+        } else if (
+          d.startSegIdx === d.numOriginalSegs - 1 &&
+          d.numOriginalSegs > 1
+        ) {
+          next = insertSegmentAtEndpoint(d.originalPoints, "end", delta);
+        } else {
+          next = translateSegmentPerpendicular(
+            d.originalPoints,
+            d.startSegIdx,
+            delta,
+          );
+        }
+        updateShape(shape.id, { points: next } as Partial<Shape>);
+      },
+      onEnd: () => {
+        segDragRef.current = null;
+      },
+    }));
+  });
+
+  return <>{nodes}</>;
+}
+
 function PenShapeNode({
   shape,
   draggable,
@@ -2424,14 +3298,23 @@ function UnifiedShapeNode({
   const h = Math.max(1, shape.height);
   const style = shape.style;
 
+  const isText = isTextElement(shape);
+  // Text elements get a faint dashed outline only while selected (and not in
+  // edit mode — TextEditOverlay draws its own teal dashed border in that
+  // state). Other shapes keep the bold solid selection ring.
   const selectStroke = selected ? accent : undefined;
-  const selectStrokeWidth = selected ? 2 : 0;
+  const selectStrokeWidth = selected ? (isText ? 1 : 2) : 0;
+  const selectDash = isText ? [4, 3] : undefined;
   const borderStroke = style.borderEnabled ? style.borderColor : undefined;
   const borderWidth = style.borderEnabled ? style.borderWeight : 0;
   // Selection ring takes priority visually if border is off.
-  const stroke = borderStroke ?? selectStroke;
-  const strokeWidth = borderStroke ? borderWidth : selectStrokeWidth;
-  const dash = style.borderEnabled ? dashFor(style.borderStyle, style.borderWeight) : undefined;
+  const stroke = borderStroke ?? (selected && !editing ? selectStroke : undefined);
+  const strokeWidth = borderStroke ? borderWidth : selected && !editing ? selectStrokeWidth : 0;
+  const dash = style.borderEnabled
+    ? dashFor(style.borderStyle, style.borderWeight)
+    : selected && !editing
+      ? selectDash
+      : undefined;
 
   // Fill: image-pattern overrides solid color when set + image loaded.
   const fillProps: Record<string, unknown> = {};
@@ -2533,21 +3416,41 @@ function UnifiedShapeNode({
       />
     );
 
-  // In-shape text overlay (centered, clipped to bbox). Suppressed while the
-  // HTML textarea overlay is active for this shape (edit mode).
+  // In-shape text overlay. Suppressed while the HTML textarea overlay is
+  // active for this shape (edit mode). Optional bg Rect renders behind the
+  // text when text.bgColor is set; transparent when undefined.
   const text = shape.text;
   const showText = !!text && text.text.length > 0 && !editing;
+  const indentPx = (text?.indent ?? 0) * 16;
+  const showBg = !!text && !!text.bgColor && !editing;
   return (
     <Group>
       {node}
+      {showBg && (
+        <Rect
+          x={shape.x}
+          y={shape.y}
+          width={w}
+          height={h}
+          rotation={shape.rotation ?? 0}
+          fill={text!.bgColor}
+          listening={false}
+        />
+      )}
       {showText && (
         <Text
-          x={shape.x + 6}
+          x={shape.x + 6 + indentPx}
           y={shape.y + 6}
-          width={w - 12}
+          width={Math.max(1, w - 12 - indentPx)}
           height={h - 12}
           rotation={shape.rotation ?? 0}
-          text={text!.bullets ? prefixBullets(text!.text) : text!.text}
+          text={formatListLines(
+            text!.text,
+            text!.bullets,
+            text!.indent ?? 0,
+            text!.bulletStyle,
+            text!.numberStyle,
+          )}
           fontFamily={text!.font}
           fontSize={text!.fontSize}
           fontStyle={fontStyleFor(text!.bold, text!.italic)}
@@ -2569,13 +3472,6 @@ function fontStyleFor(bold: boolean, italic: boolean): string {
   return parts.join(" ") || "normal";
 }
 
-function prefixBullets(text: string): string {
-  return text
-    .split("\n")
-    .map((line) => (line.length ? `\u2022 ${line}` : line))
-    .join("\n");
-}
-
 function hitTest(sh: Shape, x: number, y: number): boolean {
   if (sh.type === "rect" || sh.type === "sticky" || sh.type === "image") {
     const w = sh.width;
@@ -2585,11 +3481,6 @@ function hitTest(sh: Shape, x: number, y: number): boolean {
   if (sh.type === "shape") {
     const w = sh.width;
     const h = sh.height;
-    return x >= sh.x && x <= sh.x + w && y >= sh.y && y <= sh.y + h;
-  }
-  if (sh.type === "text") {
-    const w = (sh.text.length * sh.fontSize) / 2;
-    const h = sh.fontSize * 1.2;
     return x >= sh.x && x <= sh.x + w && y >= sh.y && y <= sh.y + h;
   }
   if (sh.type === "line" || sh.type === "pen") {

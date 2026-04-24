@@ -28,6 +28,7 @@ export const SHORTCUTS: ShortcutRow[] = [
   { group: "Tools", keys: "L", label: "Line" },
   { group: "Tools", keys: "S", label: "Sticky note" },
   { group: "Tools", keys: "T", label: "Text" },
+  { group: "Tools", keys: "C", label: "Comment" },
   { group: "Tools", keys: "U", label: "Upload image" },
   // Selection / Edit
   { group: "Edit", keys: "Esc", label: "Clear selection" },
@@ -64,7 +65,7 @@ export const SHORTCUTS: ShortcutRow[] = [
   { group: "Sheets", keys: `${ALT} \u2192`, label: "Next sheet" },
   { group: "Sheets", keys: `${ALT} \u2190`, label: "Previous sheet" },
   // Present / Help
-  { group: "Present", keys: `${SHIFT} F5`, label: "Enter present mode" },
+  { group: "Present", keys: "F5", label: "Enter present mode" },
   { group: "Help", keys: "?", label: "Show this cheatsheet" },
 ];
 
@@ -85,6 +86,7 @@ const TOOL_KEYS: Record<string, string> = {
   l: "line",
   s: "sticky",
   t: "text",
+  c: "comment",
 };
 
 // Viewport midpoint is used as the zoom anchor for Mod+=/Mod+-.
@@ -109,6 +111,13 @@ export function useShortcuts() {
       const lower = key.length === 1 ? key.toLowerCase() : key;
       const s = useStore.getState();
 
+      // When SpacePresent is active (selecting modal or presenting fullscreen),
+      // its own handler (src/hooks/usePresenterKeys.ts) owns the keyboard.
+      // Return early so editor shortcuts don't fire — e.g. Delete/Backspace
+      // while presenting would otherwise try to delete a shape in the editor
+      // underneath.
+      if (s.presentationStatus !== "idle") return;
+
       // ----- Cheatsheet open/close (works anywhere) -----
       if (!mod && !e.altKey && (key === "?" || (e.shiftKey && key === "/"))) {
         e.preventDefault();
@@ -124,6 +133,12 @@ export function useShortcuts() {
         }
         if (s.showShortcuts) {
           s.setShowShortcuts(false);
+          return;
+        }
+        // A selected ruler guide is its own focused object — Esc removes it
+        // (matches Delete/Backspace behavior the user expects for guides).
+        if (s.selectedGuideId) {
+          s.deleteGuide(s.selectedGuideId);
           return;
         }
         s.selectShape(null);
@@ -306,12 +321,12 @@ export function useShortcuts() {
       }
       if (mod && !e.shiftKey && key === "/") {
         e.preventDefault();
-        s.setShowRightSidebar(!s.showRightSidebar);
+        s.openRightPanel(s.showRightSidebar ? null : "views");
         return;
       }
       if (mod && e.shiftKey && lower === "m") {
         e.preventDefault();
-        s.setShowComments(!s.showComments);
+        s.openRightPanel(s.showComments ? null : "comments");
         return;
       }
       if (mod && !e.shiftKey && key === ",") {
@@ -366,14 +381,24 @@ export function useShortcuts() {
       }
 
       // ----- Present -----
-      if (e.shiftKey && key === "F5") {
+      // F5 mirrors the PowerPoint/Keynote convention for starting a show.
+      // We preventDefault to stop the browser reload; the check for no
+      // modifiers (!mod && !e.shiftKey && !e.altKey) keeps Ctrl+F5 and
+      // Shift+F5 free as browser hard-reload shortcuts in development.
+      if (key === "F5" && !mod && !e.shiftKey && !e.altKey) {
         e.preventDefault();
-        s.setPresenting(true);
+        s.startPresentation();
         return;
       }
 
       // ----- Delete/Backspace on shape (no modifier) -----
       if (!mod && !e.altKey && (key === "Delete" || key === "Backspace")) {
+        // Selected ruler guide takes priority — same key, dedicated target.
+        if (s.selectedGuideId) {
+          e.preventDefault();
+          s.deleteGuide(s.selectedGuideId);
+          return;
+        }
         // Multi-selection: delete every selected shape in one undo step.
         if (s.selectedShapeIds.length > 1) {
           e.preventDefault();

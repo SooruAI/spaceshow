@@ -7,7 +7,8 @@ export type Tool =
   | "line"
   | "sticky"
   | "text"
-  | "upload";
+  | "upload"
+  | "comment";
 
 export type ShapeType =
   | "rect"
@@ -15,7 +16,6 @@ export type ShapeType =
   | "line"
   | "pen"
   | "sticky"
-  | "text"
   | "image";
 
 export type ShapeKind =
@@ -65,12 +65,97 @@ export interface RectShape extends BaseShape {
 
 export interface LineShape extends BaseShape {
   type: "line";
-  points: number[]; // flat [x1,y1,x2,y2,...]
+  /** User-placed pivots: flat [startX, startY, w1X, w1Y, …, endX, endY].
+   *  Corners (for elbow) and Bézier control points (for curved) are derived
+   *  at render time — the pivots are the first-class state. */
+  points: number[];
+  routing?: LineRouting;
+  pattern?: LinePattern;
+  startMarker?: LineMarkerKind;
+  endMarker?: LineMarkerKind;
+  /** 0..1. Multiplied into the stroke's alpha channel at render time. */
+  opacity?: number;
+  /** Fixed per-line so the elbow shape doesn't flip across the 45° diagonal
+   *  while the user drags a waypoint. "HV" = horizontal leg first.
+   *  Only meaningful when routing === "elbow". */
+  elbowOrientation?: "HV" | "VH";
+  /** −2..+2 signed perpendicular offset of Bézier controls as a fraction of
+   *  the chord length. 0 = straight. Only meaningful when routing === "curved". */
+  curvature?: number;
 }
 
 export type PenVariant = "pen" | "marker" | "highlighter";
 
 export type EraserVariant = "stroke" | "object";
+
+/** Routing style for lines — straight segment, right-angled elbow, or
+ *  smooth curve. Only "straight" is rendered today; the other values are
+ *  recorded so the future scene renderer can respect them. */
+export type LineRouting = "straight" | "elbow" | "curved";
+
+/** Stroke pattern for lines. */
+export type LinePattern = "solid" | "dashed" | "dotted";
+
+/** End-cap glyph. Mirrored on the Start side via an SVG transform. */
+export type LineMarkerKind =
+  | "none"
+  | "standardArrow"
+  | "solidArrow"
+  | "openCircle"
+  | "solidCircle"
+  | "openSquare"
+  | "solidSquare"
+  | "openDiamond"
+  | "solidDiamond"
+  | "flatBar";
+
+export const LINE_ROUTINGS: ReadonlyArray<{
+  value: LineRouting;
+  label: string;
+}> = [
+  { value: "straight", label: "Straight" },
+  { value: "elbow", label: "Elbow" },
+  { value: "curved", label: "Curved" },
+];
+
+export const LINE_PATTERNS: ReadonlyArray<{
+  value: LinePattern;
+  label: string;
+}> = [
+  { value: "solid", label: "Solid" },
+  { value: "dashed", label: "Dashed" },
+  { value: "dotted", label: "Dotted" },
+];
+
+export const LINE_MARKER_KINDS: ReadonlyArray<{
+  value: LineMarkerKind;
+  label: string;
+}> = [
+  { value: "none", label: "None" },
+  { value: "standardArrow", label: "Standard arrow" },
+  { value: "solidArrow", label: "Solid arrow" },
+  { value: "openCircle", label: "Open circle" },
+  { value: "solidCircle", label: "Solid circle" },
+  { value: "openSquare", label: "Open square" },
+  { value: "solidSquare", label: "Solid square" },
+  { value: "openDiamond", label: "Open diamond" },
+  { value: "solidDiamond", label: "Solid diamond" },
+  { value: "flatBar", label: "Flat bar" },
+];
+
+export const LINE_COLOR_PRESETS: ReadonlyArray<{
+  label: string;
+  value: string;
+}> = [
+  { label: "Black", value: "#2c2a27" },
+  { label: "Blue", value: "#3b82f6" },
+  { label: "Red", value: "#ef4444" },
+  { label: "Green", value: "#22c55e" },
+  { label: "Orange", value: "#f97316" },
+  { label: "Purple", value: "#8b5cf6" },
+  { label: "Pink", value: "#ec4899" },
+  { label: "White", value: "#ffffff" },
+];
 
 export interface PenVariantSettings {
   color: string;
@@ -109,13 +194,6 @@ export interface StickyShape extends BaseShape {
   text: string;
 }
 
-export interface TextShape extends BaseShape {
-  type: "text";
-  text: string;
-  fontSize: number;
-  width?: number;
-}
-
 export interface ImageShape extends BaseShape {
   type: "image";
   width: number;
@@ -143,6 +221,21 @@ export interface ShapeStyle {
   };
 }
 
+export type ListStyle = "none" | "bulleted" | "numbered";
+
+/** Bullet glyph styles. The visible glyph cascades with `indent`: at indent N
+ *  the rendered glyph is the cascade element offset by N from the base style.
+ *  See `src/lib/listFormat.ts`. */
+export type BulletStyle = "disc" | "circle" | "square" | "dash" | "arrow";
+
+/** Number-format styles. Same cascading rule as `BulletStyle`. */
+export type NumberStyle =
+  | "decimal"
+  | "decimal-paren"
+  | "alpha-lower"
+  | "alpha-upper"
+  | "roman-lower";
+
 /** In-shape text content with rich formatting. */
 export interface TextContent {
   text: string;
@@ -153,7 +246,15 @@ export interface TextContent {
   italic: boolean;
   underline: boolean;
   align: "left" | "center" | "right";
-  bullets: boolean;
+  bullets: ListStyle;
+  /** 0..6 indent levels. */
+  indent: number;
+  /** Optional background fill behind the text. Undefined = transparent. */
+  bgColor?: string;
+  /** Base bullet style at indent 0; undefined = "disc". Cascades with indent. */
+  bulletStyle?: BulletStyle;
+  /** Base number style at indent 0; undefined = "decimal". Cascades with indent. */
+  numberStyle?: NumberStyle;
 }
 
 /** Unified shape primitive — covers all 14 design-tool kinds. */
@@ -175,7 +276,6 @@ export type Shape =
   | LineShape
   | PenShape
   | StickyShape
-  | TextShape
   | ImageShape;
 
 export type PaperSize =
@@ -238,6 +338,18 @@ export interface Board {
   name: string;
 }
 
+/** A global, world-space reference line. "h" guides are horizontal — they
+ *  have a world-Y value and span the whole board left-to-right. "v" guides
+ *  are vertical — they have a world-X value and span top-to-bottom.
+ *  Guides are NOT per-sheet; a single flat list lives at the top level and
+ *  renders over all sheets/board layers. */
+export interface Guide {
+  id: string;
+  axis: "h" | "v";
+  /** World-space position: Y for horizontal guides, X for vertical. */
+  value: number;
+}
+
 export interface Iteration {
   id: string;
   name: string;
@@ -251,4 +363,49 @@ export interface ViewItem {
   favorite: boolean;
   hidden: boolean;
   addedAt: number;
+}
+
+// ── Comments domain ───────────────────────────────────────────────────────
+/** Opaque TipTap JSONContent. Treated as-is at the store seam so types.ts
+ *  doesn't pull TipTap types into every module. */
+export type TipTapDoc = { type: "doc"; content?: unknown[] };
+
+export type CommentsView = "list" | "focused";
+
+/** A spatial comment pin anchored to a sheet or the free board. Coordinates
+ *  are sheet-local when canvasId !== "board" (same convention as shapes). */
+export interface Thread {
+  id: string;
+  canvasId: string;               // sheetId or "board"
+  coordinates: { x: number; y: number };
+  status: "open" | "resolved";
+  createdAt: number;
+}
+
+/** A single Comment in a thread. parentId=null marks the root comment;
+ *  replies carry the root comment's id as parentId. */
+export interface Comment {
+  id: string;
+  threadId: string;
+  authorId: string;
+  content: TipTapDoc;
+  createdAt: number;
+  parentId: string | null;
+}
+
+/** File attached to a Comment. fileUrl is a data URL in v1 — treat as an
+ *  opaque blob-handle stand-in; a backend will replace it later. */
+export interface Attachment {
+  id: string;
+  commentId: string;
+  fileUrl: string;
+  fileType: "image" | "pdf";
+  fileName: string;
+}
+
+export interface User {
+  id: string;
+  name: string;
+  avatarUrl: string;
+  color?: string;
 }

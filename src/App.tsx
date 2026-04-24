@@ -1,13 +1,15 @@
 import { useEffect, useRef, useState } from "react";
+import { PanelLeftOpen, PanelRightOpen } from "lucide-react";
 import { TopBar } from "./components/TopBar";
 import { LeftSidebar } from "./components/LeftSidebar";
 import { Toolbar } from "./components/Toolbar";
+import { LineToolMenu } from "./components/LineToolMenu";
 import { SheetToolbar } from "./components/SheetToolbar";
 import { Canvas } from "./components/Canvas";
 import { RightSidebar } from "./components/RightSidebar";
 import { BottomBar } from "./components/BottomBar";
-import { CommentsPanel } from "./components/CommentsPanel";
-import { PresentMode } from "./components/PresentMode";
+import { CommentsSidebar } from "./components/comments/CommentsSidebar";
+import { SpacePresent } from "./components/SpacePresent";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { ProfilePanel } from "./components/ProfilePanel";
 import { ShortcutsCheatsheet } from "./components/ShortcutsCheatsheet";
@@ -19,12 +21,14 @@ import type { Shape } from "./types";
 
 export default function App() {
   const showComments = useStore((s) => s.showComments);
-  const presenting = useStore((s) => s.presenting);
+  const presentationStatus = useStore((s) => s.presentationStatus);
   const showSettings = useStore((s) => s.showSettings);
   const showProfile = useStore((s) => s.showProfile);
   const showShortcuts = useStore((s) => s.showShortcuts);
   const showLeftSidebar = useStore((s) => s.showLeftSidebar);
+  const setShowLeftSidebar = useStore((s) => s.setShowLeftSidebar);
   const showRightSidebar = useStore((s) => s.showRightSidebar);
+  const openRightPanel = useStore((s) => s.openRightPanel);
   const addShape = useStore((s) => s.addShape);
   const activeSheetId = useStore((s) => s.activeSheetId);
 
@@ -133,21 +137,54 @@ export default function App() {
       <TopBar />
       <div className="flex-1 flex min-h-0 relative">
         {showLeftSidebar && <LeftSidebar />}
+        {/* Floating expand button — appears when the left sidebar is
+            collapsed so users can always bring it back without leaving
+            the canvas or hunting for a shortcut. Sits below the horizontal
+            ruler (RULER_SIZE = 28px) so it doesn't overlap tick marks. */}
+        {!showLeftSidebar && (
+          <button
+            type="button"
+            onClick={() => setShowLeftSidebar(true)}
+            title="Show sidebar"
+            aria-label="Show sidebar"
+            className="absolute top-10 left-10 z-30 w-8 h-8 rounded-md inline-flex items-center justify-center bg-ink-700 border border-ink-600 text-ink-100 hover:bg-ink-600 shadow-lg transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/60"
+          >
+            <PanelLeftOpen size={15} />
+          </button>
+        )}
         <div ref={canvasWrapRef} className="flex-1 relative bg-ink-800">
           <Toolbar onUploadClick={handleUpload} />
+          <LineToolMenu />
           <Canvas width={size.w} height={size.h} />
           <SheetToolbar />
           <TextEditOverlay />
           <TextFormatBar />
           <FloatingAddSheet />
-          {showComments && <CommentsPanel />}
         </div>
-        {showRightSidebar && <RightSidebar />}
+        {showComments && <CommentsSidebar />}
+        {showRightSidebar && !showComments && <RightSidebar />}
+        {/* Mirror of the left-side expand affordance — same style, anchored
+            to the right edge so the pattern is symmetric. Only renders when
+            the right rail is fully collapsed; while Comments is docked, the
+            swap-to-views affordance lives inside the Comments header so it
+            doesn't float over the sidebar and silently no-op. Matches the
+            left expand button's vertical offset so both sit below the ruler. */}
+        {!showRightSidebar && !showComments && (
+          <button
+            type="button"
+            onClick={() => openRightPanel("views")}
+            title="Show views"
+            aria-label="Show views"
+            className="absolute top-10 right-3 z-30 w-8 h-8 rounded-md inline-flex items-center justify-center bg-ink-700 border border-ink-600 text-ink-100 hover:bg-ink-600 shadow-lg transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/60"
+          >
+            <PanelRightOpen size={15} />
+          </button>
+        )}
         {showSettings && <SettingsPanel />}
         {showProfile && <ProfilePanel />}
       </div>
       <BottomBar viewportW={size.w} viewportH={size.h} />
-      {presenting && <PresentMode />}
+      {presentationStatus !== "idle" && <SpacePresent />}
       {showShortcuts && <ShortcutsCheatsheet />}
       <input
         ref={fileRef}
