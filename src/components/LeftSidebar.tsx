@@ -1,8 +1,6 @@
 import {
-  ArrowDown,
-  ArrowLeft,
+  ArrowLeftRight,
   ArrowRight,
-  ArrowUp,
   CheckSquare,
   ChevronDown,
   ChevronRight,
@@ -16,9 +14,11 @@ import {
   Hexagon,
   Image as ImageIcon,
   Minus,
+  Move,
   Octagon,
   PanelLeftClose,
   Pen,
+  Plus,
   SlidersHorizontal,
   Square,
   Star,
@@ -58,10 +58,10 @@ function shapeIcon(sh: Shape) {
       case "star": return <Star size={12} />;
       case "heart": return <Heart size={12} />;
       case "cloud": return <Cloud size={12} />;
-      case "arrow-left": return <ArrowLeft size={12} />;
       case "arrow-right": return <ArrowRight size={12} />;
-      case "arrow-up": return <ArrowUp size={12} />;
-      case "arrow-down": return <ArrowDown size={12} />;
+      case "arrow-double": return <ArrowLeftRight size={12} />;
+      case "arrow-quad": return <Move size={12} />;
+      case "plus": return <Plus size={12} />;
       case "tickbox": return <CheckSquare size={12} />;
       case "radio": return <CircleDot size={12} />;
       case "toggle": return <ToggleRight size={12} />;

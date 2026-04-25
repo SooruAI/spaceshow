@@ -7,6 +7,7 @@ export type Tool =
   | "line"
   | "sticky"
   | "text"
+  | "table"
   | "upload"
   | "comment";
 
@@ -16,7 +17,8 @@ export type ShapeType =
   | "line"
   | "pen"
   | "sticky"
-  | "image";
+  | "image"
+  | "table";
 
 export type ShapeKind =
   | "rectangle"
@@ -27,10 +29,10 @@ export type ShapeKind =
   | "star"
   | "heart"
   | "cloud"
-  | "arrow-left"
   | "arrow-right"
-  | "arrow-up"
-  | "arrow-down"
+  | "arrow-double"
+  | "arrow-quad"
+  | "plus"
   | "tickbox"
   | "radio"
   | "toggle"
@@ -414,7 +416,8 @@ export interface TextContent {
  */
 export type EditingTextTarget =
   | { kind: "shape"; id: string }
-  | { kind: "sticky"; id: string; field: "header" | "body" };
+  | { kind: "sticky"; id: string; field: "header" | "body" }
+  | { kind: "table-cell"; id: string; row: number; col: number };
 
 /** Unified shape primitive — covers all 14 design-tool kinds. */
 export interface ShapeShape extends BaseShape {
@@ -423,10 +426,88 @@ export interface ShapeShape extends BaseShape {
   width: number;
   height: number;
   style: ShapeStyle;
-  /** Optional in-shape text (Figma/PowerPoint style). */
+  /** Optional in-shape text (Figma/PowerPoint style). For form-control kinds
+   *  (tickbox/radio/toggle/slider) this is the right-side label. */
   text?: TextContent;
-  /** Only meaningful when kind === "polygon". 3–12. */
+  /** Only meaningful when kind === "polygon". 3–20. */
   polygonSides?: number;
+  // Form-control state — all optional, all default to "off / centered" so
+  // shapes drawn before this addition still render the "always set" silhouette
+  // the original path generators emitted.
+  /** tickbox / radio / toggle: whether the control reads as on. Defaults to
+   *  false — i.e. unchecked / unselected / off. */
+  checked?: boolean;
+  /** slider: current value, clamped to [min, max] and snapped to `step`.
+   *  Defaults to the midpoint of [min, max] when absent. */
+  value?: number;
+  /** slider: range floor. Defaults to 0. */
+  min?: number;
+  /** slider: range ceiling. Defaults to 100. */
+  max?: number;
+  /** slider: snap interval. Defaults to 1. */
+  step?: number;
+  /** slider: track fill colour. Falls back to `style.fillColor` when absent. */
+  trackColor?: string;
+  /** slider: handle fill colour. Falls back to `style.fillColor` when absent. */
+  handleColor?: string;
+}
+
+/** Border style for table edges. Mirrors LineStyle but is a small local
+ *  enum so table rendering doesn't import line-routing code. */
+export type TableBorderStyle = "solid" | "dashed" | "dotted";
+
+export interface TableBorder {
+  weight: number;       // 0 = no border; 0.5–4 typical
+  color: string;        // CSS color
+  style: TableBorderStyle;
+}
+
+export interface TableCell {
+  /** Optional rich text. Reuses the same TextContent used by ShapeShape/Sticky.
+   *  Undefined when the cell is empty (zero JSON cost). */
+  text?: TextContent;
+  /** Per-cell background fill. Undefined = transparent (header tint or table.fill shows through). */
+  bgColor?: string;
+}
+
+/** v2 placeholder. Cells [row..row+rowSpan-1][col..col+colSpan-1] render
+ *  as a single merged cell, with content read from cells[row][col]. */
+export interface TableMerge {
+  row: number;
+  col: number;
+  rowSpan: number;
+  colSpan: number;
+}
+
+export interface TableShape extends BaseShape {
+  type: "table";
+  /** Dense matrix, rows-major. cells.length === rowHeights.length and
+   *  every cells[r].length === colWidths.length. */
+  cells: TableCell[][];
+  /** Length === rows. Source of truth for total height. */
+  rowHeights: number[];
+  /** Length === cols. Source of truth for total width. */
+  colWidths: number[];
+  /** Sparse override map for non-default borders. Implicit border (when an
+   *  edge isn't in the map) uses defaultBorder. */
+  borders?: {
+    /** Vertical edges. Key `${row}-${colBoundary}` where colBoundary is
+     *  the column-index immediately to the right of the edge (1..cols-1). */
+    v?: Record<string, TableBorder>;
+    /** Horizontal edges. Key `${rowBoundary}-${col}` where rowBoundary is
+     *  the row-index immediately below the edge (1..rows-1). */
+    h?: Record<string, TableBorder>;
+  };
+  /** Implicit border applied to every interior edge not in `borders`,
+   *  plus the outer outline. */
+  defaultBorder?: TableBorder;
+  /** When true, row 0 renders with header styling (bold, tinted bg). */
+  headerRow?: boolean;
+  /** When true, col 0 renders with header styling. */
+  headerCol?: boolean;
+  /** v2 — unused in v1, but reserved on the type so persisted v2 docs
+   *  don't break a v1 build. */
+  merges?: TableMerge[];
 }
 
 export type Shape =
@@ -435,7 +516,8 @@ export type Shape =
   | LineShape
   | PenShape
   | StickyShape
-  | ImageShape;
+  | ImageShape
+  | TableShape;
 
 export type PaperSize =
   | "A0"
@@ -532,7 +614,8 @@ export interface ViewItem {
  *  doesn't pull TipTap types into every module. */
 export type TipTapDoc = { type: "doc"; content?: unknown[] };
 
-export type CommentsView = "list" | "focused";
+// (`CommentsView` was removed — the comments sidebar is always a list now;
+// per-thread detail moved into `<ThreadPopover />`, anchored to the pin.)
 
 /** A spatial comment pin anchored to a sheet or the free board. Coordinates
  *  are sheet-local when canvasId !== "board" (same convention as shapes). */

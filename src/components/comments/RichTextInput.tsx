@@ -376,6 +376,11 @@ function buildMentionSuggestion(getUsers: () => User[]) {
           container = document.createElement("div");
           container.style.position = "absolute";
           container.style.zIndex = "60";
+          // Marker for `<ThreadPopover />`'s outside-click dismiss handler:
+          // the dropdown is portaled to <body>, so it's outside the popover
+          // DOM ref. Without this signal a click on a suggestion would
+          // close the popover before TipTap commits the mention.
+          container.setAttribute("data-comment-popover-keep-open", "");
           container.appendChild(renderer.element);
           document.body.appendChild(container);
           positionAt(props.clientRect?.());

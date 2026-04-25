@@ -1,11 +1,22 @@
 import { useEffect, useRef, useState } from "react";
-import { Sun, Moon, X, Grid3x3, Square, MoreHorizontal } from "lucide-react";
+import {
+  Sun,
+  Moon,
+  X,
+  Grid3x3,
+  Square,
+  MoreHorizontal,
+  Presentation,
+  LayoutGrid,
+} from "lucide-react";
 import { useStore } from "../store";
 import { applyTheme, getStoredTheme, type ThemeMode } from "../theme";
 import type { GridMode } from "../store";
 
 export function SettingsPanel() {
   const setShowSettings = useStore((s) => s.setShowSettings);
+  const viewMode = useStore((s) => s.viewMode);
+  const setViewMode = useStore((s) => s.setViewMode);
   const showRulerH = useStore((s) => s.showRulerH);
   const showRulerV = useStore((s) => s.showRulerV);
   const setShowRulerH = useStore((s) => s.setShowRulerH);
@@ -60,6 +71,26 @@ export function SettingsPanel() {
       </div>
 
       <div className="p-3 space-y-4">
+        {/* Workspace mode — slide-by-slide editor vs the infinity board.
+            Lives at the top so it reads as the first, most-impactful choice.
+            Reuses the ThemeChip segmented look for consistency. */}
+        <Section title="Workspace">
+          <div className="flex items-center gap-1 p-1 rounded-md surface-2">
+            <ThemeChip
+              active={viewMode === "slide"}
+              onClick={() => setViewMode("slide")}
+              icon={<Presentation size={13} />}
+              label="Slide"
+            />
+            <ThemeChip
+              active={viewMode === "board"}
+              onClick={() => setViewMode("board")}
+              icon={<LayoutGrid size={13} />}
+              label="Board"
+            />
+          </div>
+        </Section>
+
         {/* Theme */}
         <Section title="Appearance">
           <div className="flex items-center gap-1 p-1 rounded-md surface-2">

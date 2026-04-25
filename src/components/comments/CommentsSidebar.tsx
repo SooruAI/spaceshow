@@ -1,12 +1,16 @@
 import { PanelRightClose, X } from "lucide-react";
 import { useStore } from "../../store";
 import { ThreadListView } from "./ThreadListView";
-import { FocusedThreadView } from "./FocusedThreadView";
 
 /**
  * Docked right-rail comments panel. Mutex with RightSidebar (Views) via
- * openRightPanel. Dispatches between list and focused views from the
- * single commentsView store field.
+ * `openRightPanel`. The sidebar is purely a list now — clicking a row
+ * (or a pin on the canvas) opens a `<ThreadPopover />` anchored to the
+ * pin's screen position, which hosts the focused thread + composer.
+ *
+ * Pin visibility is gated on this rail being open: when the rail closes,
+ * `Canvas.tsx` unmounts the pin layer so the canvas returns to a clean
+ * working surface. Re-opening the rail restores the pins.
  *
  * Header buttons:
  *   - left : collapse the whole right rail (PanelRightClose).
@@ -15,7 +19,6 @@ import { FocusedThreadView } from "./FocusedThreadView";
  *            the header and was a no-op while comments was open).
  */
 export function CommentsSidebar() {
-  const view = useStore((s) => s.commentsView);
   const openRightPanel = useStore((s) => s.openRightPanel);
 
   return (
@@ -41,7 +44,7 @@ export function CommentsSidebar() {
           <X size={14} />
         </button>
       </div>
-      {view === "list" ? <ThreadListView /> : <FocusedThreadView />}
+      <ThreadListView />
     </div>
   );
 }

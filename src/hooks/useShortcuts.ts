@@ -452,6 +452,30 @@ export function useShortcuts() {
         return;
       }
 
+      // ----- Slide-mode prev/next (no shape selected) -----
+      // Plain Left/Right arrows in slide mode step between slides when there's
+      // no active shape selection — wrap-free (clamped at first/last). PageUp /
+      // PageDown work in slide mode regardless of selection (matches keynote).
+      // Shape-nudge below still wins when something is selected.
+      if (
+        s.viewMode === "slide" &&
+        !mod &&
+        !e.altKey &&
+        !e.shiftKey &&
+        !s.selectedShapeId &&
+        s.selectedShapeIds.length === 0 &&
+        (key === "ArrowLeft" || key === "ArrowRight")
+      ) {
+        e.preventDefault();
+        s.gotoSlideByOffset(key === "ArrowRight" ? 1 : -1);
+        return;
+      }
+      if (s.viewMode === "slide" && !mod && (key === "PageUp" || key === "PageDown")) {
+        e.preventDefault();
+        s.gotoSlideByOffset(key === "PageDown" ? 1 : -1);
+        return;
+      }
+
       // ----- Arrow nudge (no modifier, or only Shift) -----
       if (
         !mod &&

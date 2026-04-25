@@ -70,7 +70,7 @@ function Pin({ thread, zoom }: { thread: Thread; zoom: number }) {
   const isHover = useStore((s) => s.hoverThreadId === thread.id);
   const setActiveThread = useStore((s) => s.setActiveThread);
   const setHoverThreadId = useStore((s) => s.setHoverThreadId);
-  const openRightPanel = useStore((s) => s.openRightPanel);
+  const moveThread = useStore((s) => s.moveThread);
   const resolved = thread.status === "resolved";
 
   const r = 11 / zoom;
@@ -81,8 +81,50 @@ function Pin({ thread, zoom }: { thread: Thread; zoom: number }) {
 
   function onClick(e: KonvaEventObject<MouseEvent | TouchEvent>) {
     e.cancelBubble = true;
-    openRightPanel("comments");
+    // Pin layer is now mounted only when the comments rail is open
+    // (gated in Canvas.tsx by `showComments`), so we don't need to
+    // open the rail here. Just set the active thread — the
+    // ThreadPopover anchored to this pin mounts via its own gate.
+    // Konva suppresses click after a successful drag, so this fires
+    // only on a tap-without-movement and never on a drag release.
     setActiveThread(thread.id);
+  }
+
+  function setStageCursor(e: KonvaEventObject<unknown>, cursor: string) {
+    const stage = e.target.getStage();
+    if (stage) stage.container().style.cursor = cursor;
+  }
+
+  function onDragStart(e: KonvaEventObject<DragEvent>) {
+    e.cancelBubble = true;
+    setStageCursor(e, "grabbing");
+  }
+
+  function onDragMove(e: KonvaEventObject<DragEvent>) {
+    // Live-commit only when this pin's popover is open — the popover is
+    // the only consumer that needs to follow the pin during the drag,
+    // and a 60Hz store update would re-render the whole thread list /
+    // pin layer for nothing when no popover is anchored here.
+    // Pinless drags still commit a single time on dragend.
+    if (!isActive) return;
+    moveThread(thread.id, { x: e.target.x(), y: e.target.y() });
+  }
+
+  function onDragEnd(e: KonvaEventObject<DragEvent>) {
+    moveThread(thread.id, { x: e.target.x(), y: e.target.y() });
+    // If the pointer is still over the pin (typical case — user dropped
+    // it and is hovering), restore the grab cursor; otherwise clear.
+    setStageCursor(e, isHover ? "grab" : "");
+  }
+
+  function onMouseEnter(e: KonvaEventObject<MouseEvent>) {
+    setHoverThreadId(thread.id);
+    setStageCursor(e, "grab");
+  }
+
+  function onMouseLeave(e: KonvaEventObject<MouseEvent>) {
+    setHoverThreadId(null);
+    setStageCursor(e, "");
   }
 
   return (
@@ -90,8 +132,12 @@ function Pin({ thread, zoom }: { thread: Thread; zoom: number }) {
       x={thread.coordinates.x}
       y={thread.coordinates.y}
       opacity={opacity}
-      onMouseEnter={() => setHoverThreadId(thread.id)}
-      onMouseLeave={() => setHoverThreadId(null)}
+      draggable
+      onMouseEnter={onMouseEnter}
+      onMouseLeave={onMouseLeave}
+      onDragStart={onDragStart}
+      onDragMove={onDragMove}
+      onDragEnd={onDragEnd}
       onClick={onClick as (e: KonvaEventObject<MouseEvent>) => void}
       onTap={onClick as (e: KonvaEventObject<TouchEvent>) => void}
     >

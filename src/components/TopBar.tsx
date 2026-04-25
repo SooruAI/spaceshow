@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { History, MessageSquare, Play, Share2 } from "lucide-react";
 import { useStore } from "../store";
 import { AvatarStack } from "./comments/AvatarStack";
+import { ShareMenu } from "./share/ShareMenu";
 
 // SpaceDM groups tabs as: [SpaceStory] | [SpaceSheets, SpaceDesign, SpaceModule] | [SpaceShow]
 // We mirror the same three-group layout with dividers between groups.
@@ -31,6 +32,9 @@ export function TopBar() {
   const [editingPres, setEditingPres] = useState(false);
   const [draftPres, setDraftPres] = useState(presentationName);
   const presInputRef = useRef<HTMLInputElement>(null);
+
+  const [shareOpen, setShareOpen] = useState(false);
+  const shareBtnRef = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
     if (editingName) {
@@ -179,9 +183,22 @@ export function TopBar() {
           >
             <Play size={14} className="mr-1.5" /> Present
           </button>
-          <button className="pill-btn pill-btn-accent">
-            <Share2 size={14} className="mr-1.5" /> Share
-          </button>
+          <div className="relative">
+            <button
+              ref={shareBtnRef}
+              className="pill-btn pill-btn-accent"
+              aria-haspopup="dialog"
+              aria-expanded={shareOpen}
+              onClick={() => setShareOpen((o) => !o)}
+            >
+              <Share2 size={14} className="mr-1.5" /> Share
+            </button>
+            <ShareMenu
+              open={shareOpen}
+              onClose={() => setShareOpen(false)}
+              anchorRef={shareBtnRef}
+            />
+          </div>
           <button
             className={`pill-btn ${showVersions ? "pill-btn-accent" : ""}`}
             onClick={() => openRightPanel(showVersions ? null : "versions")}

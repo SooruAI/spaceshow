@@ -17,8 +17,10 @@ import {
   ListOrdered,
   PaintBucket,
   Palette,
+  Strikethrough,
   Underline,
 } from "lucide-react";
+import { fontSizeCss, parseFontSizeCss } from "../lib/tiptapExtensions";
 import { useStore } from "../store";
 import type {
   BulletStyle,
@@ -28,8 +30,10 @@ import type {
   Shape,
   ShapeShape,
   StickyShape,
+  TableShape,
   TextContent,
 } from "../types";
+import { replaceCell } from "../lib/tableLayout";
 import { FontPicker } from "./FontPicker";
 import { TextTypePicker } from "./TextTypePicker";
 import { TextColorPicker } from "./TextColorPicker";
@@ -81,6 +85,34 @@ export function TextFormatBar() {
     if (!s.editingText) return null;
     return s.shapes.find((x) => x.id === s.editingText!.id) ?? null;
   });
+  // When a text shape is just SELECTED (not being edited via the textarea
+  // overlay), still surface this bar so the user can change font / colour /
+  // bold / etc. without first dbl-clicking. Two flavours qualify:
+  //  - "Text elements" — transparent borderless ShapeShapes of kind
+  //    "rectangle" with a text payload (Canvas.tsx::isTextElement).
+  //  - Form controls (tickbox / radio / toggle / slider) with a label
+  //    text. The label IS user-formattable text, so the same per-character
+  //    affordances (font, size, color, B/I/U) apply.
+  const selectedTextShape = useStore((s) => {
+    if (s.editingText) return null; // edit takes precedence
+    const id = s.selectedShapeId;
+    if (!id) return null;
+    const sh = s.shapes.find((x) => x.id === id);
+    if (!sh || sh.type !== "shape") return null;
+    const ss = sh as ShapeShape;
+    if (!ss.text) return null;
+    const isTextElement =
+      ss.kind === "rectangle" &&
+      (ss.style.fillOpacity ?? 1) === 0 &&
+      !ss.style.borderEnabled;
+    const isFormControl =
+      ss.kind === "tickbox" ||
+      ss.kind === "radio" ||
+      ss.kind === "toggle" ||
+      ss.kind === "slider";
+    if (!isTextElement && !isFormControl) return null;
+    return ss;
+  });
   const editingTarget: EditingTextTarget | null = target;
   const editingText: TextContent | null = (() => {
     if (!editingTarget || !editingShape) return null;
@@ -88,6 +120,11 @@ export function TextFormatBar() {
       return editingShape.type === "shape"
         ? ((editingShape as ShapeShape).text ?? null)
         : null;
+    }
+    if (editingTarget.kind === "table-cell") {
+      if (editingShape.type !== "table") return null;
+      const t = editingShape as TableShape;
+      return t.cells[editingTarget.row]?.[editingTarget.col]?.text ?? null;
     }
     if (editingShape.type !== "sticky") return null;
     const sticky = editingShape as StickyShape;
@@ -100,6 +137,33 @@ export function TextFormatBar() {
   const [bulletStyleOpen, setBulletStyleOpen] = useState(false);
   const [numberStyleOpen, setNumberStyleOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
+
+  // ── Tiptap editor wiring ─────────────────────────────────────────────────
+  // When TextEditOverlay mounts a RichTextEditor (regular text shapes and
+  // sticky bodies in v1), it publishes the live editor instance here. We
+  // route per-character commands (Bold / Italic / Color / Font / etc.)
+  // through that editor instead of patching the whole TextContent.
+  // When `editor` is null, we fall back to the legacy whole-shape `patch()`
+  // path — that's how the bar still works for selected-but-not-editing text
+  // shapes and the text-tool defaults surface.
+  const editor = useStore((s) => s.activeRichTextEditor);
+
+  // Force a re-render on every Tiptap transaction so `isActive` / mark-
+  // presence reads stay live as the user moves the caret or changes the
+  // selection. The format bar is a sibling component (not a child of
+  // RichTextEditor), so without this subscription it has no way to know
+  // when the editor's internal state changes.
+  const [, force] = useState(0);
+  useEffect(() => {
+    if (!editor) return;
+    const tick = () => force((n) => n + 1);
+    editor.on("transaction", tick);
+    editor.on("selectionUpdate", tick);
+    return () => {
+      editor.off("transaction", tick);
+      editor.off("selectionUpdate", tick);
+    };
+  }, [editor]);
 
   useEffect(() => {
     function onMd(e: MouseEvent) {
@@ -117,11 +181,20 @@ export function TextFormatBar() {
   }, [colorOpen, bgOpen, bulletStyleOpen, numberStyleOpen]);
 
   const isEditing = !!editingTarget && !!editingShape && !!editingText;
-  const showBar = isEditing || tool === "text";
+  const isSelectingTextShape = !isEditing && !!selectedTextShape;
+  const showBar = isEditing || tool === "text" || isSelectingTextShape;
   if (!showBar) return null;
+  // Editor-driven per-character commands ARE selection-aware. They only
+  // apply when the rich-text editor is mounted (i.e. user is actively
+  // editing a shape's text or a sticky body). When the user has just
+  // SELECTED a text shape (no overlay), we still want Bold / Color / etc.
+  // to work — but as a whole-shape change via the legacy `patch()` path.
+  const editorActive = isEditing && !!editor;
 
   const text: TextContent = isEditing
     ? (editingText ?? DEFAULT_TEXT)
+    : isSelectingTextShape
+    ? (selectedTextShape!.text ?? DEFAULT_TEXT)
     : {
         text: "",
         font: toolFont,
@@ -143,13 +216,31 @@ export function TextFormatBar() {
     if (isEditing && editingTarget && editingShape) {
       const next = { ...text, ...p };
       // Route the write to the right field based on the active target.
-      const fieldPatch: Partial<Shape> =
-        editingTarget.kind === "shape"
-          ? ({ text: next } as Partial<Shape>)
-          : editingTarget.field === "header"
-          ? ({ header: next } as Partial<Shape>)
-          : ({ body: next } as Partial<Shape>);
+      let fieldPatch: Partial<Shape>;
+      if (editingTarget.kind === "shape") {
+        fieldPatch = { text: next } as Partial<Shape>;
+      } else if (editingTarget.kind === "table-cell") {
+        if (editingShape.type !== "table") return;
+        const t = editingShape as TableShape;
+        const existing = t.cells[editingTarget.row]?.[editingTarget.col] ?? {};
+        fieldPatch = {
+          cells: replaceCell(t.cells, editingTarget.row, editingTarget.col, {
+            ...existing,
+            text: next,
+          }),
+        } as Partial<Shape>;
+      } else if (editingTarget.field === "header") {
+        fieldPatch = { header: next } as Partial<Shape>;
+      } else {
+        fieldPatch = { body: next } as Partial<Shape>;
+      }
       updateShape(editingShape.id, fieldPatch);
+      return;
+    }
+    // Selected (not editing) text shape: write directly to its `text` field.
+    if (isSelectingTextShape && selectedTextShape) {
+      const next = { ...text, ...p };
+      updateShape(selectedTextShape.id, { text: next } as Partial<Shape>);
       return;
     }
     if (p.font !== undefined) setToolFont(p.font);
@@ -167,24 +258,280 @@ export function TextFormatBar() {
     patch({ indent: next });
   }
   function adjustFontSize(d: number) {
-    const next = Math.max(8, Math.min(200, (text.fontSize || 16) + d));
-    patch({ fontSize: next });
+    // editor's selection size if uniform, else fall back to the shape-level
+    // flat-field size. Either way clamp to the same 8..200 range.
+    const cur = (() => {
+      if (editor) {
+        const raw = (() => {
+          const state = editor.state;
+          const sel = state.selection;
+          if (sel.empty) {
+            const stored = state.storedMarks ?? sel.$from.marks();
+            const ts = stored.find((m) => m.type.name === "textStyle");
+            const v = (ts?.attrs as { fontSize?: unknown } | undefined)?.fontSize;
+            return typeof v === "string" ? v : v == null ? null : String(v);
+          }
+          let first: string | null = null;
+          let saw = false;
+          let mixed = false;
+          state.doc.nodesBetween(sel.from, sel.to, (node) => {
+            if (!node.isText || mixed) return;
+            saw = true;
+            const ts = node.marks.find((m) => m.type.name === "textStyle");
+            const v = (ts?.attrs as { fontSize?: unknown } | undefined)?.fontSize;
+            const s = typeof v === "string" ? v : v == null ? null : String(v);
+            if (first === null && !mixed) first = s;
+            else if (s !== first) mixed = true;
+          });
+          return saw && !mixed ? first : null;
+        })();
+        const n = raw ? parseFontSizeCss(raw) : NaN;
+        if (Number.isFinite(n)) return n;
+      }
+      return text.fontSize || 16;
+    })();
+    const next = Math.max(8, Math.min(200, cur + d));
+    if (editor) {
+      editor.chain().focus().setFontSize(fontSizeCss(next)).run();
+    } else {
+      patch({ fontSize: next });
+    }
   }
   function applyTextType(p: TextTypePreset) {
+    if (editorActive && editor) {
+      // Apply font size as a textStyle attr; bold as a mark toggle. Order:
+      // size first (always set), then ensure bold matches the preset.
+      editor.chain().focus().setFontSize(fontSizeCss(p.fontSize)).run();
+      const isBold = editor.isActive("bold");
+      if (p.bold && !isBold) editor.chain().focus().toggleBold().run();
+      else if (!p.bold && isBold) editor.chain().focus().toggleBold().run();
+      return;
+    }
     patch({ fontSize: p.fontSize, bold: p.bold });
   }
   const currentType = inferTextType(text.fontSize, text.bold);
 
-  // When editing a sticky field, the StickyFormatBar is also mounted at the
-  // top-center anchor. Push this bar down by one bar-height (~38px) + gap so
-  // the two stack cleanly: StickyFormatBar on top, TextFormatBar directly
-  // below it. For all other targets (regular text shape, or text-tool
-  // defaults) the bar stays at its normal top-center position.
-  const STICKY_BAR_OFFSET = 46; // ~38px bar + 8px gap, hand-tuned to match
-  const topPx =
-    editingTarget?.kind === "sticky"
-      ? RULER_SIZE + 8 + STICKY_BAR_OFFSET
-      : RULER_SIZE + 8;
+  // ── Editor-driven commands & active-state reads ─────────────────────────
+  // When the rich-text editor is active, every Bold / Italic / Underline /
+  // Strike / Color / Font / FontSize / Align / List click runs through
+  // Tiptap's chain() commands. Those commands operate on the current
+  // selection — which is exactly what gives us per-character formatting.
+  //
+  // The `markPresence` walker returns "off" / "on" / "mixed" so the buttons
+  // can render an indeterminate state when the selection spans values for
+  // the underlying mark. Tiptap's `editor.isActive` only returns true when
+  // ALL text in the selection carries the mark, false otherwise — so we
+  // can't distinguish "none" from "some" from `isActive` alone.
+
+  function markPresence(name: string): "off" | "on" | "mixed" {
+    if (!editor) return "off";
+    const state = editor.state;
+    const sel = state.selection;
+    if (sel.empty) {
+      // Caret only: stored marks decide the next-typed character.
+      const stored = state.storedMarks ?? sel.$from.marks();
+      return stored.some((m) => m.type.name === name) ? "on" : "off";
+    }
+    let any = false;
+    let all = true;
+    let saw = false;
+    state.doc.nodesBetween(sel.from, sel.to, (node) => {
+      if (!node.isText) return;
+      saw = true;
+      const has = node.marks.some((m) => m.type.name === name);
+      if (has) any = true;
+      else all = false;
+    });
+    if (!saw) return "off";
+    return any && all ? "on" : any ? "mixed" : "off";
+  }
+
+  // Collect a uniform attribute value across the selection's text-style
+  // marks. Returns the value when all text nodes carry the SAME value,
+  // else returns null (the caller falls back to "(mixed)" or the stored-
+  // mark / flat-field value, depending on context).
+  function uniformTextStyleAttr(attr: "color" | "fontFamily" | "fontSize"): string | null {
+    if (!editor) return null;
+    const state = editor.state;
+    const sel = state.selection;
+    if (sel.empty) {
+      const stored = state.storedMarks ?? sel.$from.marks();
+      const ts = stored.find((m) => m.type.name === "textStyle");
+      const v = (ts?.attrs as Record<string, unknown> | undefined)?.[attr];
+      return typeof v === "string" ? v : v == null ? null : String(v);
+    }
+    let firstSeen: string | null = null;
+    let saw = false;
+    let mixed = false;
+    state.doc.nodesBetween(sel.from, sel.to, (node) => {
+      if (!node.isText || mixed) return;
+      saw = true;
+      const ts = node.marks.find((m) => m.type.name === "textStyle");
+      const v = ts ? ((ts.attrs as Record<string, unknown>)[attr] as unknown) : null;
+      const s = v == null ? null : typeof v === "string" ? v : String(v);
+      if (firstSeen === null && !mixed) {
+        firstSeen = s;
+      } else if (s !== firstSeen) {
+        mixed = true;
+      }
+    });
+    if (!saw || mixed) return null;
+    return firstSeen;
+  }
+
+  // Editor-aware reads for the format bar's button states. When `editor`
+  // is null these all return the flat-field value (whole-shape model).
+  const ed = editorActive ? editor : null;
+  const boldState = ed ? markPresence("bold") : (text.bold ? "on" : "off");
+  const italicState = ed ? markPresence("italic") : (text.italic ? "on" : "off");
+  const underlineState = ed ? markPresence("underline") : (text.underline ? "on" : "off");
+  const strikeState = ed ? markPresence("strike") : ((text.strike ?? false) ? "on" : "off");
+  const selectionColor = ed ? (uniformTextStyleAttr("color") ?? null) : null;
+  const selectionFont = ed ? (uniformTextStyleAttr("fontFamily") ?? null) : null;
+  const selectionFontSize = ed
+    ? (() => {
+        const raw = uniformTextStyleAttr("fontSize");
+        if (raw == null) return null;
+        const n = parseFontSizeCss(raw);
+        return Number.isFinite(n) ? n : null;
+      })()
+    : null;
+  const selectionBg = ed
+    ? (() => {
+        const state = ed.state;
+        const sel = state.selection;
+        if (sel.empty) {
+          const stored = state.storedMarks ?? sel.$from.marks();
+          const hl = stored.find((m) => m.type.name === "highlight");
+          return (hl?.attrs as { color?: string } | undefined)?.color ?? null;
+        }
+        let first: string | null = null;
+        let saw = false;
+        let mixed = false;
+        state.doc.nodesBetween(sel.from, sel.to, (node) => {
+          if (!node.isText || mixed) return;
+          saw = true;
+          const hl = node.marks.find((m) => m.type.name === "highlight");
+          const c = (hl?.attrs as { color?: string } | undefined)?.color ?? null;
+          if (first === null && !mixed) first = c;
+          else if (c !== first) mixed = true;
+        });
+        return saw && !mixed ? first : null;
+      })()
+    : null;
+
+  // The values displayed in the font/size pickers and the bold/italic
+  // active styling. When the selection is uniform (single value) we show
+  // it; when mixed we fall back to the flat-field value (TextContent's
+  // snapshot from the lead run). This keeps the UI sensible without
+  // showing a stale value when the selection is mixed.
+  const displayColor = selectionColor ?? text.color;
+  const displayFont = selectionFont ?? text.font;
+  const displayFontSize = selectionFontSize ?? text.fontSize;
+  const displayBg = selectionBg ?? (text.bgColor ?? null);
+
+  // Editor-aware command wrappers. When the editor is active these route
+  // through Tiptap; otherwise they fall back to the legacy `patch()` path.
+  const cmdToggleBold = () => {
+    if (ed) ed.chain().focus().toggleBold().run();
+    else patch({ bold: !text.bold });
+  };
+  const cmdToggleItalic = () => {
+    if (ed) ed.chain().focus().toggleItalic().run();
+    else patch({ italic: !text.italic });
+  };
+  const cmdToggleUnderline = () => {
+    if (ed) ed.chain().focus().toggleUnderline().run();
+    else patch({ underline: !text.underline });
+  };
+  const cmdToggleStrike = () => {
+    if (ed) ed.chain().focus().toggleStrike().run();
+    else patch({ strike: !(text.strike ?? false) });
+  };
+  const cmdSetColor = (c: string) => {
+    if (ed) ed.chain().focus().setColor(c).run();
+    else patch({ color: c });
+  };
+  const cmdSetBgColor = (c: string | null) => {
+    if (ed) {
+      if (c) ed.chain().focus().setHighlight({ color: c }).run();
+      else ed.chain().focus().unsetHighlight().run();
+    } else {
+      patch({ bgColor: c ?? undefined });
+    }
+  };
+  const cmdSetFont = (f: string) => {
+    if (ed) ed.chain().focus().setFontFamily(f).run();
+    else patch({ font: f });
+  };
+  const cmdSetFontSize = (px: number) => {
+    if (ed) ed.chain().focus().setFontSize(fontSizeCss(px)).run();
+    else patch({ fontSize: px });
+  };
+  const cmdSetAlign = (a: "left" | "center" | "right" | "justify") => {
+    if (ed) ed.chain().focus().setTextAlign(a).run();
+    else patch({ align: a });
+  };
+  const cmdToggleBulletList = () => {
+    if (ed) ed.chain().focus().toggleBulletList().run();
+    else setBullets("bulleted");
+  };
+  const cmdToggleOrderedList = () => {
+    if (ed) ed.chain().focus().toggleOrderedList().run();
+    else setBullets("numbered");
+  };
+  const cmdAdjustIndent = (d: number) => {
+    if (ed) {
+      // Inside a list, sink/lift the list item — that's the natural
+      // "indent" inside a bulletList/orderedList structure.
+      if (ed.isActive("bulletList") || ed.isActive("orderedList")) {
+        if (d > 0) ed.chain().focus().sinkListItem("listItem").run();
+        else ed.chain().focus().liftListItem("listItem").run();
+        return;
+      }
+      // Outside a list, the flat shape-level indent applies. We still
+      // patch it whole-shape; no per-paragraph indent in v1.
+    }
+    adjustIndent(d);
+  };
+  // Suppress unused warnings — these helpers are wired into the JSX below.
+  void cmdToggleBulletList; void cmdToggleOrderedList; void cmdAdjustIndent;
+
+  // Helper: given a 3-state mark presence, render the right CSS class.
+  function btnClass(state: "off" | "on" | "mixed"): string | undefined {
+    if (state === "on") return "row-active";
+    if (state === "mixed") return "row-mixed";
+    return undefined;
+  }
+  void btnClass; // referenced by ToggleBtnState below
+
+
+  // When another floating bar shares the top-center anchor, push this one
+  // down by one bar-height (~38px) + gap so the two stack cleanly:
+  // - sticky edit:        StickyFormatBar on top, TextFormatBar below
+  // - shape edit:         ShapeOptionsBar on top, TextFormatBar below (per
+  //                       UX request for double-click-to-edit on shapes)
+  // - form-control select: ShapeOptionsBar stays mounted for tickbox /
+  //                       radio / toggle / slider; their label TextFormatBar
+  //                       sits below it so users can format the label
+  //                       without overlapping the shape toolkit. Text
+  //                       elements (transparent rectangles) DON'T trigger
+  //                       this — the SheetToolbar dispatcher short-circuits
+  //                       ShapeOptionsBar for them, freeing the top slot.
+  const STACK_OFFSET = 46; // ~38px bar + 8px gap, hand-tuned to match
+  const isSelectedFormControl =
+    !!selectedTextShape &&
+    (selectedTextShape.kind === "tickbox" ||
+      selectedTextShape.kind === "radio" ||
+      selectedTextShape.kind === "toggle" ||
+      selectedTextShape.kind === "slider");
+  const stackOnTopOfAnotherBar =
+    editingTarget?.kind === "sticky" ||
+    editingTarget?.kind === "shape" ||
+    isSelectedFormControl;
+  const topPx = stackOnTopOfAnotherBar
+    ? RULER_SIZE + 8 + STACK_OFFSET
+    : RULER_SIZE + 8;
 
   return (
     <div
@@ -202,9 +549,11 @@ export function TextFormatBar() {
       <Divider />
 
       <FontPicker
-        value={text.font}
+        value={displayFont}
         onChange={(v) => {
-          patch({ font: v });
+          cmdSetFont(v);
+          // Always also update the tool default so picking a font during
+          // edit influences the next-created text shape's seed.
           setToolFont(v);
         }}
       />
@@ -229,15 +578,11 @@ export function TextFormatBar() {
           type="number"
           min={8}
           max={200}
-          value={text.fontSize}
-          onChange={(e) =>
-            patch({
-              fontSize: Math.max(
-                8,
-                Math.min(200, Number(e.target.value) || 16)
-              ),
-            })
-          }
+          value={displayFontSize}
+          onChange={(e) => {
+            const n = Math.max(8, Math.min(200, Number(e.target.value) || 16));
+            cmdSetFontSize(n);
+          }}
           onKeyDown={(e) => {
             if (e.key === "ArrowUp") {
               e.preventDefault();
@@ -286,13 +631,13 @@ export function TextFormatBar() {
           <Palette size={13} />
           <span
             className="inline-block w-3.5 h-3.5 rounded-sm ring-1 ring-black/40"
-            style={{ background: text.color }}
+            style={{ background: displayColor }}
           />
         </button>
         {colorOpen && (
           <TextColorPicker
-            value={text.color}
-            onChange={(c) => patch({ color: c })}
+            value={displayColor}
+            onChange={(c) => cmdSetColor(c)}
             onClose={() => setColorOpen(false)}
           />
         )}
@@ -315,19 +660,19 @@ export function TextFormatBar() {
           <span
             className="inline-block w-3.5 h-3.5 rounded-sm ring-1 ring-black/40 relative overflow-hidden"
             style={{
-              background: text.bgColor ?? "transparent",
-              backgroundImage: text.bgColor
+              background: displayBg ?? "transparent",
+              backgroundImage: displayBg
                 ? undefined
                 : "linear-gradient(45deg, #888 25%, transparent 25%, transparent 75%, #888 75%), linear-gradient(45deg, #888 25%, transparent 25%, transparent 75%, #888 75%)",
-              backgroundSize: text.bgColor ? undefined : "6px 6px",
-              backgroundPosition: text.bgColor ? undefined : "0 0, 3px 3px",
+              backgroundSize: displayBg ? undefined : "6px 6px",
+              backgroundPosition: displayBg ? undefined : "0 0, 3px 3px",
             }}
           />
         </button>
         {bgOpen && (
           <TextBackgroundColorPicker
-            value={text.bgColor ?? null}
-            onChange={(c) => patch({ bgColor: c ?? undefined })}
+            value={displayBg}
+            onChange={(c) => cmdSetBgColor(c)}
             onClose={() => setBgOpen(false)}
           />
         )}
@@ -335,54 +680,61 @@ export function TextFormatBar() {
 
       <Divider />
 
-      <ToggleBtn
-        active={text.bold}
-        onClick={() => patch({ bold: !text.bold })}
+      <ToggleBtnState
+        state={boldState}
+        onClick={cmdToggleBold}
         title="Bold"
       >
         <Bold size={13} />
-      </ToggleBtn>
-      <ToggleBtn
-        active={text.italic}
-        onClick={() => patch({ italic: !text.italic })}
+      </ToggleBtnState>
+      <ToggleBtnState
+        state={italicState}
+        onClick={cmdToggleItalic}
         title="Italic"
       >
         <Italic size={13} />
-      </ToggleBtn>
-      <ToggleBtn
-        active={text.underline}
-        onClick={() => patch({ underline: !text.underline })}
+      </ToggleBtnState>
+      <ToggleBtnState
+        state={underlineState}
+        onClick={cmdToggleUnderline}
         title="Underline"
       >
         <Underline size={13} />
-      </ToggleBtn>
+      </ToggleBtnState>
+      <ToggleBtnState
+        state={strikeState}
+        onClick={cmdToggleStrike}
+        title="Strikethrough"
+      >
+        <Strikethrough size={13} />
+      </ToggleBtnState>
 
       <Divider />
 
       <ToggleBtn
         active={text.align === "left"}
-        onClick={() => patch({ align: "left" })}
+        onClick={() => cmdSetAlign("left")}
         title="Align left"
       >
         <AlignLeft size={13} />
       </ToggleBtn>
       <ToggleBtn
         active={text.align === "center"}
-        onClick={() => patch({ align: "center" })}
+        onClick={() => cmdSetAlign("center")}
         title="Align center"
       >
         <AlignCenter size={13} />
       </ToggleBtn>
       <ToggleBtn
         active={text.align === "right"}
-        onClick={() => patch({ align: "right" })}
+        onClick={() => cmdSetAlign("right")}
         title="Align right"
       >
         <AlignRight size={13} />
       </ToggleBtn>
       <ToggleBtn
         active={text.align === "justify"}
-        onClick={() => patch({ align: "justify" })}
+        onClick={() => cmdSetAlign("justify")}
         title="Justify"
       >
         <AlignJustify size={13} />
@@ -419,10 +771,10 @@ export function TextFormatBar() {
       <Divider />
 
       <ListSplitButton
-        active={text.bullets === "bulleted"}
+        active={text.bullets === "bulleted" || (ed?.isActive("bulletList") ?? false)}
         title="Bulleted list"
         onToggle={() => {
-          setBullets("bulleted");
+          cmdToggleBulletList();
           setBulletStyleOpen(false);
         }}
         open={bulletStyleOpen}
@@ -459,10 +811,10 @@ export function TextFormatBar() {
         )}
       </ListSplitButton>
       <ListSplitButton
-        active={text.bullets === "numbered"}
+        active={text.bullets === "numbered" || (ed?.isActive("orderedList") ?? false)}
         title="Numbered list"
         onToggle={() => {
-          setBullets("numbered");
+          cmdToggleOrderedList();
           setNumberStyleOpen(false);
         }}
         open={numberStyleOpen}
@@ -503,14 +855,14 @@ export function TextFormatBar() {
 
       <ToggleBtn
         active={false}
-        onClick={() => adjustIndent(-1)}
+        onClick={() => cmdAdjustIndent(-1)}
         title="Decrease indent"
       >
         <IndentDecrease size={13} />
       </ToggleBtn>
       <ToggleBtn
         active={false}
-        onClick={() => adjustIndent(1)}
+        onClick={() => cmdAdjustIndent(1)}
         title="Increase indent"
       >
         <IndentIncrease size={13} />
@@ -540,6 +892,40 @@ function ToggleBtn({
       className={`h-7 w-7 grid place-items-center rounded text-xs transition-colors ${
         active ? "row-active" : "hover:bg-ink-700 text-ink-200"
       }`}
+    >
+      {children}
+    </button>
+  );
+}
+
+/** Three-state variant of `ToggleBtn` used for marks that come from the
+ *  rich-text editor's selection. "on" = uniformly applied across selection,
+ *  "off" = absent, "mixed" = some chars have it and some don't (rendered
+ *  with the half-tinted `row-mixed` style + corner dot from index.css). */
+function ToggleBtnState({
+  state,
+  onClick,
+  title,
+  children,
+}: {
+  state: "off" | "on" | "mixed";
+  onClick: () => void;
+  title: string;
+  children: React.ReactNode;
+}) {
+  const cls =
+    state === "on"
+      ? "row-active"
+      : state === "mixed"
+      ? "row-mixed"
+      : "hover:bg-ink-700 text-ink-200";
+  return (
+    <button
+      onMouseDown={(e) => e.preventDefault()}
+      onClick={onClick}
+      title={title}
+      aria-pressed={state === "on" ? true : state === "mixed" ? "mixed" : false}
+      className={`h-7 w-7 grid place-items-center rounded text-xs transition-colors ${cls}`}
     >
       {children}
     </button>

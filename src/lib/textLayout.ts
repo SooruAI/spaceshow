@@ -266,19 +266,33 @@ function runsFromBlock(block: Node, defaults: LayoutDefaults, heading: 1 | 2 | 3
 }
 
 function buildRun(node: Node, defaults: LayoutDefaults, heading: 1 | 2 | 3 | undefined): Run {
-  const headingDefaults =
-    heading !== undefined
-      ? { fontSize: HEADING_SIZE[heading], bold: true }
-      : { fontSize: defaults.fontSize, bold: defaults.bold };
+  // Toggle marks (bold / italic / underline / strike) follow Tiptap's "mark
+  // presence = on, absence = off" semantics — they DON'T inherit from the
+  // shape-level defaults. If the user typed "Hello" bold then " world"
+  // unbold, the second run lacks a bold mark and must render unbold even
+  // when the lead-run snapshot lifted bold:true onto the flat fields.
+  //
+  // Headings are the one exception: a `heading` block attribute carries an
+  // implicit bold + larger size for runs without their own textStyle. Tiptap
+  // models this via the heading node, not via per-run marks, so we synthesise
+  // those defaults here only when `heading` is set.
+  const isHeading = heading !== undefined;
   const r: Run = {
     text: node.text ?? "",
+    // Attribute defaults (font / fontSize / color / bgColor) DO inherit —
+    // an absent textStyle mark means "use the shape's default", which is
+    // exactly the legacy single-style behaviour.
     fontFamily: defaults.font,
-    fontSize: headingDefaults.fontSize,
+    fontSize: isHeading ? HEADING_SIZE[heading] : defaults.fontSize,
     color: defaults.color,
-    bold: headingDefaults.bold,
-    italic: defaults.italic,
-    underline: defaults.underline,
-    strike: defaults.strike,
+    // Toggle marks default OFF for non-headings. Headings start bold; the
+    // per-run mark loop below can still flip individual runs back to non-
+    // bold via … there's no Tiptap "remove bold" mark, so headings stay
+    // bold for every run in v1. That matches the legacy behaviour.
+    bold: isHeading,
+    italic: false,
+    underline: false,
+    strike: false,
     bgColor: defaults.bgColor,
   };
   for (const m of node.marks ?? []) {

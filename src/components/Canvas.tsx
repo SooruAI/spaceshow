@@ -19,6 +19,10 @@ import type Konva from "konva";
 import type { KonvaEventObject } from "konva/lib/Node";
 import { KIND_RENDERER, shapePathFor } from "../lib/shapePaths";
 import {
+  FORM_CONTROL_GLYPH_CAP,
+  computeFormControlLayout,
+} from "../lib/shapeLayout";
+import {
   EPS,
   computeElbowPath,
   segmentAxis,
@@ -58,12 +62,14 @@ import {
   MIN_ERASER_SCREEN_PX,
   MAX_ERASER_SCREEN_PX,
 } from "../lib/zoom";
+import { clampSlidePan } from "../lib/slidePan";
 import { Rulers, RULER_SIZE } from "./Rulers";
 import { GuideLayer } from "./GuideLayer";
 import { CommentPinLayer } from "./comments/CommentPinLayer";
+import { ThreadPopover } from "./comments/ThreadPopover";
 import { collectSnapPoints, snapValue, type SnapKind } from "../lib/snap";
 import { formatListLines } from "../lib/listFormat";
-import { hasDocContent } from "../lib/tiptapDoc";
+import { DEFAULT_TEXT_FONT } from "../lib/fonts";
 import { RichTextRender } from "./RichTextRender";
 import {
   DEFAULT_STICKY_BG,
@@ -86,7 +92,10 @@ import type {
   Sheet,
   Shape,
   ShapeShape,
+  TableShape,
 } from "../types";
+import { TableNode } from "./table/TableNode";
+import { distributeWidths } from "../lib/tableLayout";
 
 /**
  * Build a CSS `cursor` value that renders a small pen/marker/highlighter
@@ -223,6 +232,7 @@ export function Canvas({ width, height }: Props) {
   const showRulerV = useStore((s) => s.showRulerV);
   const gridMode = useStore((s) => s.gridMode);
   const gridGap = useStore((s) => s.gridGap);
+  const viewMode = useStore((s) => s.viewMode);
   const toolColors = useStore((s) => s.toolColors);
   const toolStrokeWidth = useStore((s) => s.toolStrokeWidth);
   const toolFontSize = useStore((s) => s.toolFontSize);
@@ -234,6 +244,7 @@ export function Canvas({ width, height }: Props) {
   const eraserSize = useStore((s) => s.eraserSize);
   const shapeKind = useStore((s) => s.shapeKind);
   const shapeDefaults = useStore((s) => s.shapeDefaults);
+  const defaultPolygonSides = useStore((s) => s.defaultPolygonSides);
   const lineRouting = useStore((s) => s.lineRouting);
   const linePattern = useStore((s) => s.linePattern);
   const lineStartMarker = useStore((s) => s.lineStartMarker);
@@ -248,6 +259,10 @@ export function Canvas({ width, height }: Props) {
   const deleteGuide = useStore((s) => s.deleteGuide);
   const setSelectedGuideId = useStore((s) => s.setSelectedGuideId);
   const theme = useThemeVars();
+
+  // Comments rail state — gates the pin layer + thread popover.
+  const showComments = useStore((s) => s.showComments);
+  const activeThreadId = useStore((s) => s.activeThreadId);
 
   const stageRef = useRef<Konva.Stage>(null);
   const worldGroupRef = useRef<Konva.Group>(null);
@@ -349,6 +364,20 @@ export function Canvas({ width, height }: Props) {
       }
     };
   }, []);
+
+  // Slide-mode auto-fit: whenever the active sheet changes (or we enter
+  // slide mode, or the viewport resizes), animate the viewport to fit that
+  // sheet. Single source of truth — gotoSlide intentionally doesn't call
+  // zoomToSheet itself, so we don't double-animate.
+  //
+  // Width/height deps catch (a) the initial mount where viewportSize is
+  // still 0 (effect early-returns, then refires after ResizeObserver) and
+  // (b) window resizes (re-center the slide).
+  useEffect(() => {
+    if (viewMode !== "slide") return;
+    if (width === 0 || height === 0 || !activeSheetId) return;
+    useStore.getState().zoomToSheet(activeSheetId, width, height);
+  }, [viewMode, activeSheetId, width, height]);
 
   // Cross-browser backstop for suppressing the browser's native right-click
   // menu. Konva's `onContextMenu` prop wires a React synthetic handler on the
@@ -501,7 +530,10 @@ export function Canvas({ width, height }: Props) {
       const sh = byId.get(id);
       if (
         !sh ||
-        (sh.type !== "shape" && sh.type !== "image" && sh.type !== "pen") ||
+        (sh.type !== "shape" &&
+          sh.type !== "image" &&
+          sh.type !== "pen" &&
+          sh.type !== "rect") ||
         !sh.visible ||
         sh.locked
       )
@@ -680,10 +712,28 @@ export function Canvas({ width, height }: Props) {
         };
       } else {
         // Pan. No store write.
-        panRef.current = {
+        let next = {
           x: panRef.current.x - e.deltaX,
           y: panRef.current.y - e.deltaY,
         };
+        // In slide mode clamp the imperative pan so the gesture itself
+        // stops at the active slide + neighbors bbox — without this the
+        // user would visually pan into empty space and then snap back on
+        // the 100ms commit (when store.setPan re-clamps), which feels
+        // jarring. The neighbors-only clamp (lib/slidePan.ts) keeps an
+        // outlier slide far away from expanding the pan range.
+        const st = useStore.getState();
+        if (st.viewMode === "slide") {
+          next = clampSlidePan(
+            next,
+            st.sheets,
+            st.activeSheetId,
+            zoomRef.current,
+            st.viewportSize.w,
+            st.viewportSize.h,
+          );
+        }
+        panRef.current = next;
       }
       applyTransform();
       scheduleCommit();
@@ -1205,6 +1255,52 @@ export function Canvas({ width, height }: Props) {
       };
     } else if (tool === "shape") {
       const isPolygon = shapeKind === "polygon";
+      // Tickbox / Radio / Toggle / Slider are click-to-place (per UX
+      // spec): no drag, fixed default glyph + label sizing, default
+      // label so the user sees a complete control the moment they tap.
+      // The drawing-state branch below is short-circuited a few lines
+      // down.
+      const isClickPlace =
+        shapeKind === "tickbox" ||
+        shapeKind === "radio" ||
+        shapeKind === "toggle" ||
+        shapeKind === "slider";
+      const defaultLabel =
+        shapeKind === "tickbox"
+          ? "Checkbox"
+          : shapeKind === "radio"
+            ? "Option"
+            : shapeKind === "toggle"
+              ? "Toggle"
+              : shapeKind === "slider"
+                ? "Slider"
+                : "";
+      const clickPlaceText = isClickPlace
+        ? {
+            text: defaultLabel,
+            font: "Inter",
+            fontSize: 14,
+            color: "#1f2937",
+            bold: false,
+            italic: false,
+            underline: false,
+            align: "left" as const,
+            bullets: "none" as const,
+            indent: 0,
+            autoFit: false,
+          }
+        : undefined;
+      // Slider needs a bit more room so the track has visible play after
+      // the label takes its 40% on the left. Other click-place kinds use
+      // the standard 220 × 28.
+      const isSliderPlace = shapeKind === "slider";
+      const w0 = isSliderPlace ? 280 : isClickPlace ? 220 : 1;
+      const h0 = isClickPlace ? 28 : 1;
+      // Slider also needs default min/max/value/step so the visual handle
+      // has somewhere to sit and the value-on-click handler can interpolate.
+      const sliderDefaults = isSliderPlace
+        ? { min: 0, max: 100, value: 50, step: 1 }
+        : {};
       newShape = {
         id,
         type: "shape",
@@ -1215,10 +1311,20 @@ export function Canvas({ width, height }: Props) {
         locked: false,
         x: localX,
         y: localY,
-        width: 1,
-        height: 1,
+        width: w0,
+        height: h0,
         style: { ...shapeDefaults },
-        ...(isPolygon ? { polygonSides: 5 } : {}),
+        // The toolbar's polygon picker prompts for sides up front and stores
+        // the result in `defaultPolygonSides`; consume that here so the drawn
+        // polygon honours the user's choice instead of a hardcoded default.
+        ...(isPolygon ? { polygonSides: defaultPolygonSides } : {}),
+        // Slider doesn't carry a checked state; the others do.
+        ...(isClickPlace
+          ? {
+              text: clickPlaceText,
+              ...(isSliderPlace ? sliderDefaults : { checked: false }),
+            }
+          : {}),
       } as Shape;
     } else if (tool === "pen") {
       const variantSettings = penVariants[penVariant];
@@ -1352,6 +1458,32 @@ export function Canvas({ width, height }: Props) {
       selectShape(txt.id);
       useStore.getState().beginTextEdit(txt.id);
       return;
+    } else if (tool === "table") {
+      const tableDefaults = useStore.getState().tableDefaults;
+      // Drag-to-draw starts at 1×1 and grows the grid as the user drags —
+      // rows/cols are derived from the drag bbox in onMouseMove (one cell
+      // per defaultColWidth × defaultRowHeight chunk). The 10×10 picker is
+      // the path for users who want to specify dimensions up front.
+      newShape = {
+        id,
+        type: "table",
+        sheetId,
+        name: "Table",
+        visible: true,
+        locked: false,
+        x: localX,
+        y: localY,
+        rotation: 0,
+        cells: [[{}]],
+        rowHeights: [1],
+        colWidths: [1],
+        defaultBorder: {
+          color: tableDefaults.borderColor,
+          weight: tableDefaults.borderWeight,
+          style: tableDefaults.borderStyle,
+        },
+        fill: toolColors.table ?? "#ffffff",
+      } as TableShape;
     } else if (tool === "eraser") {
       if (eraserVariant === "object") {
         // hit-test top-most shape on this sheet and delete
@@ -1378,6 +1510,25 @@ export function Canvas({ width, height }: Props) {
       // snapshot captured there is the only one pushed for this gesture.
       useStore.getState().beginHistoryCoalesce(`draw-${newShape.id}`);
       addShape(newShape);
+      // Tickbox / Radio / Toggle / Slider are click-to-place: commit
+      // immediately and flip back to the select tool so the user gets
+      // the Transformer + ShapeOptionsBar on their freshly-placed
+      // control. Skip `setDrawing` so the move/up pipeline below doesn't
+      // try to drag-resize a fixed-size control.
+      if (newShape.type === "shape") {
+        const sk = (newShape as ShapeShape).kind;
+        if (
+          sk === "tickbox" ||
+          sk === "radio" ||
+          sk === "toggle" ||
+          sk === "slider"
+        ) {
+          useStore.getState().endHistoryCoalesce();
+          setTool("select");
+          useStore.getState().selectShape(newShape.id);
+          return;
+        }
+      }
       setDrawing(newShape);
       if (newShape.type === "pen" || newShape.type === "line") {
         drawPointsRef.current = [...newShape.points];
@@ -1416,10 +1567,25 @@ export function Canvas({ width, height }: Props) {
       // HTML "+" overlay. No store write -> no React re-render. The store is
       // synced on mouseup so other components (Rulers, BottomBar) see the
       // committed value.
-      panRef.current = {
+      let next = {
         x: panRef.current.x + dx,
         y: panRef.current.y + dy,
       };
+      // Slide-mode clamp the imperative drag for the same reason as the
+      // wheel branch — gesture must visually stop at the active+neighbors
+      // bbox so there is no snap-back on mouseup commit.
+      const st = useStore.getState();
+      if (st.viewMode === "slide") {
+        next = clampSlidePan(
+          next,
+          st.sheets,
+          st.activeSheetId,
+          zoom,
+          st.viewportSize.w,
+          st.viewportSize.h,
+        );
+      }
+      panRef.current = next;
       const wg = worldGroupRef.current;
       if (wg) {
         wg.position({ x: panRef.current.x, y: panRef.current.y });
@@ -1498,6 +1664,43 @@ export function Canvas({ width, height }: Props) {
       const start = drawPointsRef.current.slice(0, 2);
       scheduleDrawPatch(drawing.id, {
         points: [start[0], start[1], localX, localY],
+      } as Partial<Shape>);
+    } else if (drawing.type === "table") {
+      const dx = localX - drawing.x;
+      const dy = localY - drawing.y;
+      const shift = !!e.evt.shiftKey;
+      let w = dx;
+      let h = dy;
+      if (shift) {
+        const m = Math.max(Math.abs(dx), Math.abs(dy));
+        w = (dx < 0 ? -1 : 1) * m;
+        h = (dy < 0 ? -1 : 1) * m;
+      }
+      // Negative-direction drag: shift x/y so the bbox always covers
+      // (start ↔ current pointer). Mirrors the rect/shape drag math.
+      const nx = drawing.x + Math.min(0, w);
+      const ny = drawing.y + Math.min(0, h);
+      const aw = Math.abs(w);
+      const ah = Math.abs(h);
+      // Derive grid dimensions live from the drag bbox: one cell per
+      // default cell size. The picker is the path for users who want to
+      // specify dimensions up front; drag-to-draw scales the grid with
+      // the gesture so a small drag → small table, big drag → big table.
+      const tableDefaults = useStore.getState().tableDefaults;
+      const cols = Math.max(1, Math.round(aw / tableDefaults.defaultColWidth));
+      const rows = Math.max(1, Math.round(ah / tableDefaults.defaultRowHeight));
+      // Cells (always empty during a draw gesture) are rebuilt to match
+      // the new dimensions; safe because the user can't have typed into
+      // a cell of a still-being-drawn table.
+      const cells = Array.from({ length: rows }, () =>
+        Array.from({ length: cols }, () => ({}))
+      );
+      scheduleDrawPatch(drawing.id, {
+        x: nx,
+        y: ny,
+        cells,
+        colWidths: distributeWidths(Math.max(cols, aw), cols),
+        rowHeights: distributeWidths(Math.max(rows, ah), rows),
       } as Partial<Shape>);
     }
   }
@@ -1647,6 +1850,11 @@ export function Canvas({ width, height }: Props) {
       const h = sh.height;
       return { x: ox + sh.x, y: oy + sh.y, w, h };
     }
+    if (sh.type === "table") {
+      const w = sh.colWidths.reduce((a, b) => a + b, 0);
+      const h = sh.rowHeights.reduce((a, b) => a + b, 0);
+      return { x: ox + sh.x, y: oy + sh.y, w, h };
+    }
     if (sh.type === "line" || sh.type === "pen") {
       const pts = sh.points;
       if (!pts || pts.length < 2) return null;
@@ -1774,6 +1982,23 @@ export function Canvas({ width, height }: Props) {
           Math.abs((sh as RectShape | ShapeShape).height) < 3)
       ) {
         useStore.getState().deleteShape(sh.id);
+      }
+      // Single-click on canvas with the table tool (no drag) creates a
+      // sub-pixel table from the initial fractional widths. Treat it as a
+      // mis-click and remove it so the picker remains the canonical "drop
+      // a default-sized table" entry point.
+      if (sh && sh.type === "table") {
+        const totalW = (sh as TableShape).colWidths.reduce(
+          (a, b) => a + b,
+          0,
+        );
+        const totalH = (sh as TableShape).rowHeights.reduce(
+          (a, b) => a + b,
+          0,
+        );
+        if (totalW < 6 || totalH < 6) {
+          useStore.getState().deleteShape(sh.id);
+        }
       }
       // Zero-length lines (single click, no drag) get cleaned up so the
       // store doesn't accumulate invisible stubs that still render handle
@@ -1955,7 +2180,16 @@ export function Canvas({ width, height }: Props) {
               scaleX={zoom}
               scaleY={zoom}
             >
-              {sheets.map((s) => {
+              {/* Slide mode renders ONLY the active slide — the other
+                  sheets and free-board shapes are out of scope. Pan is
+                  clamped to the active slide's bbox in lib/slidePan.ts so
+                  the user can detail-pan within the slide but cannot reach
+                  another slide by panning. Switching slides is exclusively
+                  via Prev/Next, keyboard, or the LeftSidebar Sheets tab. */}
+              {(viewMode === "slide"
+                ? sheets.filter((s) => s.id === activeSheetId)
+                : sheets
+              ).map((s) => {
                 const isFocused =
                   s.id === selectedSheetId || selectedSheetIds.includes(s.id);
                 const isActive = s.id === activeSheetId;
@@ -2128,7 +2362,10 @@ export function Canvas({ width, height }: Props) {
                   re-render at the new position; we deliberately do NOT
                   compensate child shape local coords, so content ends up
                   in the new world position (moved-with-the-sheet). */}
-              {sheets.map((s) => {
+              {(viewMode === "slide"
+                ? sheets.filter((s) => s.id === activeSheetId)
+                : sheets
+              ).map((s) => {
                 const rotation = s.rotation ?? 0;
                 const cx = s.x + s.width / 2;
                 const cy = s.y + s.height / 2;
@@ -2183,7 +2420,20 @@ export function Canvas({ width, height }: Props) {
                   in the same layer so they always sit on top of other board
                   shapes (canvas-level annotation invariant). The board layer
                   itself already renders after every per-sheet group, so
-                  stickies end up above sheet content automatically. */}
+                  stickies end up above sheet content automatically.
+                  View-mode behaviour:
+                    • Board mode: render BOTH non-stickies and stickies.
+                    • Slide mode: render ONLY stickies — they're canvas-level
+                      annotations that should follow the user across views.
+                      Without this, pasting/creating a sticky in slide mode
+                      silently makes it "disappear" (the data lives in the
+                      store on sheetId === "board" but the layer that paints
+                      it is gated off, so the sticky never reaches the stage).
+                      Non-sticky board content stays workspace-only because
+                      it's typically scratchpad that doesn't belong on a
+                      presented slide.
+                    • Presentation mode: handled by `<SpacePresent>` taking
+                      over the viewport entirely; this branch never renders. */}
               {(() => {
                 const board = shapesBySheet.get("board") || [];
                 const nonStickies = board.filter((s) => s.type !== "sticky");
@@ -2213,16 +2463,20 @@ export function Canvas({ width, height }: Props) {
                 );
                 return (
                   <>
-                    {nonStickies.map(renderOne)}
+                    {viewMode === "board" && nonStickies.map(renderOne)}
                     {stickies.map(renderOne)}
                   </>
                 );
               })()}
               {/* Comment pins — rendered above shapes but below selection
                   chrome so they remain visible regardless of what's
-                  currently selected. Lives inside the world <Group> so pan
-                  / zoom / sheet rotation come for free. */}
-              <CommentPinLayer zoom={zoom} />
+                  currently selected. Lives inside the world <Group> so
+                  pan / zoom / sheet rotation come for free.
+                  Mounted only when the comments rail is open (gating
+                  pin visibility on the rail's open state per the v2
+                  spec; closing the rail returns the canvas to a clean
+                  working surface). */}
+              {showComments && <CommentPinLayer zoom={zoom} />}
               {/* Marquee overlay — blue semi-transparent rect while dragging. */}
               {marquee && (
                 <Rect
@@ -2387,6 +2641,23 @@ export function Canvas({ width, height }: Props) {
                         height: newH,
                         rotation: node.rotation(),
                       } as Partial<Shape>);
+                    } else if (sh.type === "rect") {
+                      // Legacy RectShape: same geometry write as ShapeShape's
+                      // top-left renderer. Reset scale so a follow-up drag
+                      // doesn't compound on top of the baked-in dimensions.
+                      const sx = Math.abs(node.scaleX());
+                      const sy = Math.abs(node.scaleY());
+                      const newW = Math.max(3, sh.width * sx);
+                      const newH = Math.max(3, sh.height * sy);
+                      node.scaleX(1);
+                      node.scaleY(1);
+                      updateShape(id, {
+                        x: node.x(),
+                        y: node.y(),
+                        width: newW,
+                        height: newH,
+                        rotation: node.rotation(),
+                      } as Partial<Shape>);
                     } else if (sh.type === "pen") {
                       // Pens: we expose rotation + drag only (scale anchors
                       // are hidden by the effect that binds nodes). Reset
@@ -2499,6 +2770,15 @@ export function Canvas({ width, height }: Props) {
           </div>
         )}
       </div>
+      {/* Thread popover — DOM-rendered, position: fixed. Mounted as a
+          sibling of the Stage so it overlays the canvas without becoming
+          part of the Konva render tree. Gated on `showComments` so a
+          stale `activeThreadId` after the rail is closed (theoretically
+          possible if some side-effect path forgot to clear it) can't
+          render an orphan popover. */}
+      {showComments && activeThreadId && (
+        <ThreadPopover threadId={activeThreadId} />
+      )}
     </div>
   );
 }
@@ -3398,6 +3678,58 @@ function ShapeNode({
   const strokeWidth = selected ? 2 : 0;
 
   if (shape.type === "rect") {
+    // Dbl-click on a legacy RectShape promotes it to a ShapeShape (so the
+    // text-edit pipeline, which expects ShapeShape.style / .text, has the
+    // schema it needs) and immediately enters text edit. Mirrors the
+    // dbl-click affordance on the new shapes; without this migration the
+    // textarea overlay can't read/write back into the rect's missing
+    // `text` field.
+    function migrateAndEditText() {
+      if (shape.locked) return;
+      const r = shape as RectShape;
+      useStore.getState().updateShape(r.id, {
+        type: "shape",
+        kind: "rectangle",
+        style: {
+          borderEnabled: !!r.stroke,
+          borderWeight: r.strokeWidth ?? 2,
+          borderColor: r.stroke ?? "#2c2a27",
+          borderStyle: "solid",
+          cornerRadius: 2,
+          fillColor: r.fill ?? "#cccccc",
+          fillOpacity: 1,
+        },
+        // Seed empty text with autoFit OFF so entering edit mode doesn't
+        // collapse the user's existing rectangle to the textarea's content
+        // size (autoFit defaults to true via `text.autoFit !== false`,
+        // which would shrink a 360×220 box to ~40×40 the moment the
+        // overlay mounts). The user can still resize manually.
+        text: {
+          text: "",
+          font: DEFAULT_TEXT_FONT,
+          fontSize: 16,
+          color: "#1f2937",
+          bold: false,
+          italic: false,
+          underline: false,
+          align: "left",
+          bullets: "none",
+          indent: 0,
+          autoFit: false,
+        },
+        // Strip legacy fields so the new renderer (UnifiedShapeNode) reads
+        // exclusively from `style`.
+        fill: undefined,
+        stroke: undefined,
+        strokeWidth: undefined,
+      } as Partial<Shape>);
+      // Select the shape too so ShapeOptionsBar can render alongside the
+      // TextFormatBar (per UX: shape toolkit on top of text toolkit during
+      // double-click edit). Without this `selectedShapeId` stays null and
+      // ShapeOptionsBar's selector returns null.
+      useStore.getState().selectShape(r.id);
+      useStore.getState().beginTextEdit(r.id);
+    }
     return (
       <Rect
         id={shape.id}
@@ -3412,6 +3744,14 @@ function ShapeNode({
         draggable={draggable}
         onClick={onSelect}
         onTap={onSelect}
+        onDblClick={(e) => {
+          e.cancelBubble = true;
+          migrateAndEditText();
+        }}
+        onDblTap={(e) => {
+          e.cancelBubble = true;
+          migrateAndEditText();
+        }}
         onDragStart={handleDragStart}
         onDragMove={handleDragMove}
         onDragEnd={(e) =>
@@ -3847,6 +4187,33 @@ function ShapeNode({
         onDragStartProxy={handleDragStart}
         onDragMoveProxy={handleDragMove}
         onDragEndProxy={(e: KonvaEventObject<DragEvent>, patch: Partial<Shape>) => handleDragEndWith(e, patch)}
+      />
+    );
+  }
+  if (shape.type === "table") {
+    const editingCell =
+      editingText?.kind === "table-cell" && editingText.id === shape.id
+        ? { row: editingText.row, col: editingText.col }
+        : null;
+    return (
+      <TableNode
+        table={shape}
+        selected={selected}
+        accent={accent}
+        draggable={draggable && !shape.locked}
+        editingCell={editingCell}
+        onSelect={onSelect}
+        onDblClickCell={(row, col) => {
+          if (shape.locked) return;
+          useStore
+            .getState()
+            .beginTextEdit({ kind: "table-cell", id: shape.id, row, col });
+        }}
+        onDragStart={handleDragStart}
+        onDragMove={handleDragMove}
+        onDragEnd={(e: KonvaEventObject<DragEvent>) =>
+          handleDragEndWith(e, { x: e.target.x(), y: e.target.y() })
+        }
       />
     );
   }
@@ -5183,12 +5550,69 @@ function UnifiedShapeNode({
   const editingTextId = useStore((s) => s.editingTextShapeId);
   const editing = editingTextId === shape.id;
   const beginTextEdit = useStore((s) => s.beginTextEdit);
+  const selectShapeAction = useStore((s) => s.selectShape);
+  const setShapeCheckedAction = useStore((s) => s.setShapeChecked);
+  const setRadioCheckedAction = useStore((s) => s.setRadioChecked);
+  const setSliderValueAction = useStore((s) => s.setSliderValue);
   const [fillImg] = useImage(shape.style.imageFill?.src ?? "");
 
   const renderer = KIND_RENDERER[shape.kind];
   const w = Math.max(1, shape.width);
   const h = Math.max(1, shape.height);
   const style = shape.style;
+
+  // Form-control layout: glyph rect (where the tickbox / slider visuals
+  // draw) vs. label rect (where the text sits next to the glyph). Shared
+  // with TextEditOverlay via `computeFormControlLayout` so the dbl-click
+  // textarea opens over the same label area we render here.
+  const isTickboxLike =
+    shape.kind === "tickbox" ||
+    shape.kind === "radio" ||
+    shape.kind === "toggle";
+  const isSlider = shape.kind === "slider";
+  const isFormControl = isTickboxLike || isSlider;
+  const labelText = shape.text;
+  const hasLabel = !!labelText && labelText.text.length > 0;
+  // Cap the glyph at FORM_CONTROL_GLYPH_CAP for tickbox-like kinds so the
+  // visible control stays small even when the user grows the bbox vertically
+  // for a multi-line label. Slider keeps its full-height strip.
+  const glyphSize = isTickboxLike ? FORM_CONTROL_GLYPH_CAP : undefined;
+  const { glyphRect, labelRect } = computeFormControlLayout(
+    shape.kind,
+    w,
+    h,
+    hasLabel,
+    glyphSize,
+  );
+
+  /**
+   * Single-click handler shared by glyph + label rects on form controls.
+   * Always selects first so handles + ShapeOptionsBar mount, then runs the
+   * kind-specific action: toggle for tickbox/toggle, group-exclusive set
+   * for radio, click-to-position for slider.
+   */
+  function handleFormControlClick(
+    e: KonvaEventObject<MouseEvent | TouchEvent>
+  ) {
+    e.cancelBubble = true;
+    selectShapeAction(shape.id);
+    if (shape.kind === "radio") {
+      setRadioCheckedAction(shape.id);
+    } else if (shape.kind === "tickbox" || shape.kind === "toggle") {
+      setShapeCheckedAction(shape.id, !shape.checked);
+    } else if (shape.kind === "slider") {
+      // Pointer position in world coords → fraction along the visible glyph
+      // strip → store via the clamp/snap-aware setter.
+      const stage = e.target.getStage();
+      const ptr = stage?.getRelativePointerPosition?.();
+      if (!ptr) return;
+      const localX = ptr.x - shape.x - glyphRect.x;
+      const frac = Math.max(0, Math.min(1, localX / Math.max(1, glyphRect.w)));
+      const min = shape.min ?? 0;
+      const max = shape.max ?? 100;
+      setSliderValueAction(shape.id, min + frac * (max - min));
+    }
+  }
 
   const isText = isTextElement(shape);
   // Text elements get a faint dashed outline only while selected (and not in
@@ -5244,18 +5668,32 @@ function UnifiedShapeNode({
     strokeWidth,
     dash,
     draggable,
-    onClick: onSelect,
-    onTap: onSelect,
+    // Form controls intercept click to toggle/set state in addition to
+    // selecting. Other kinds keep the plain `onSelect` behaviour. Konva
+    // suppresses `onClick` when a real drag occurs, so move-by-drag stays
+    // unaffected.
+    onClick: isFormControl
+      ? (e: KonvaEventObject<MouseEvent>) =>
+          handleFormControlClick(e as KonvaEventObject<MouseEvent | TouchEvent>)
+      : onSelect,
+    onTap: isFormControl
+      ? (e: KonvaEventObject<TouchEvent>) =>
+          handleFormControlClick(e as KonvaEventObject<MouseEvent | TouchEvent>)
+      : onSelect,
     onDragStart: onDragStartProxy,
     onDragMove: onDragMoveProxy,
     onDragEnd: (e: KonvaEventObject<DragEvent>) =>
       onDragEndProxy(e, { x: e.target.x(), y: e.target.y() }),
     onDblClick: (e: KonvaEventObject<MouseEvent>) => {
       e.cancelBubble = true;
+      // Select first so ShapeOptionsBar mounts on top of TextFormatBar
+      // during the edit (per UX: shape toolkit on top of text toolkit).
+      selectShapeAction(shape.id);
       beginTextEdit(shape.id);
     },
     onDblTap: (e: KonvaEventObject<TouchEvent>) => {
       e.cancelBubble = true;
+      selectShapeAction(shape.id);
       beginTextEdit(shape.id);
     },
     rotation: shape.rotation ?? 0,
@@ -5287,7 +5725,7 @@ function UnifiedShapeNode({
         {...commonProps}
         x={shape.x + w / 2}
         y={shape.y + h / 2}
-        sides={shape.kind === "triangle" ? 3 : Math.max(3, Math.min(12, shape.polygonSides ?? 6))}
+        sides={shape.kind === "triangle" ? 3 : Math.max(3, Math.min(20, shape.polygonSides ?? 6))}
         radius={Math.min(w, h) / 2}
       />
     ) : renderer === "star" ? (
@@ -5299,12 +5737,280 @@ function UnifiedShapeNode({
         innerRadius={Math.min(w, h) / 4}
         outerRadius={Math.min(w, h) / 2}
       />
+    ) : shape.kind === "slider" ? (
+      // Slider gets a polished Material-style render:
+      //  - Invisible bbox-sized Rect (commonProps: id / onClick /
+      //    draggable). Click-to-set-value AND Transformer anchor live here.
+      //  - Background track (rounded Rect, neutral gray) — full track width.
+      //  - Active fill (rounded Rect, accent) — from track left to handle x,
+      //    only when the value is past min.
+      //  - Handle Circle (accent fill + white inner ring + soft shadow) —
+      //    sits at the value's interpolated position along the track.
+      // All visible nodes are listening:false so clicks pass through to the
+      // bbox rect (which fires handleFormControlClick → setSliderValue).
+      (() => {
+        const accent = style.fillColor;
+        const trackColor = shape.trackColor ?? "#cbd5e1";
+        const handleColor = shape.handleColor ?? accent;
+        const min = shape.min ?? 0;
+        const max = shape.max ?? 100;
+        const range = max - min;
+        const value =
+          shape.value !== undefined ? shape.value : (min + max) / 2;
+        const frac =
+          range === 0 ? 0.5 : Math.max(0, Math.min(1, (value - min) / range));
+        const trackH = Math.max(3, glyphRect.h * 0.18);
+        const trackY = shape.y + glyphRect.y + (glyphRect.h - trackH) / 2;
+        const trackR = trackH / 2;
+        const handleR = Math.min(glyphRect.h * 0.45, glyphRect.w * 0.12);
+        // Track has rounded ends — its drawable area runs from trackR to
+        // glyphRect.w - trackR. Handle center maps along that interval so
+        // the handle never spills past the rounded ends.
+        const trackLeft = shape.x + glyphRect.x;
+        const handleMin = trackLeft + handleR;
+        const handleMax = trackLeft + glyphRect.w - handleR;
+        const handleX = handleMin + frac * (handleMax - handleMin);
+        const handleY = shape.y + glyphRect.y + glyphRect.h / 2;
+        // Active-fill width: from track's left round-cap up to handle x.
+        // Skip when the value is at min (would render a degenerate sliver).
+        const activeW = Math.max(0, handleX - trackLeft);
+        return (
+          <>
+            <Rect
+              {...commonProps}
+              x={shape.x}
+              y={shape.y}
+              width={w}
+              height={h}
+              fill="rgba(0,0,0,0)"
+              stroke={undefined}
+              strokeWidth={0}
+            />
+            <Rect
+              x={trackLeft}
+              y={trackY}
+              width={glyphRect.w}
+              height={trackH}
+              cornerRadius={trackR}
+              fill={trackColor}
+              listening={false}
+              rotation={shape.rotation ?? 0}
+            />
+            {activeW > trackR && (
+              <Rect
+                x={trackLeft}
+                y={trackY}
+                width={activeW}
+                height={trackH}
+                cornerRadius={trackR}
+                fill={accent}
+                listening={false}
+                rotation={shape.rotation ?? 0}
+              />
+            )}
+            <Circle
+              x={handleX}
+              y={handleY}
+              radius={handleR}
+              fill={handleColor}
+              stroke="#FFFFFF"
+              strokeWidth={Math.max(1.5, handleR * 0.18)}
+              shadowColor="rgba(0,0,0,0.3)"
+              shadowBlur={3}
+              shadowOffsetY={1}
+              listening={false}
+              rotation={shape.rotation ?? 0}
+            />
+          </>
+        );
+      })()
+    ) : shape.kind === "tickbox" ||
+       shape.kind === "radio" ||
+       shape.kind === "toggle" ? (
+      // Tickbox / Radio / Toggle get a richer multi-node treatment for max
+      // visual polish (Material / Figma style):
+      //  - Invisible bbox-sized Rect (carries commonProps: id / onClick /
+      //    draggable). This is the Transformer anchor + click target so
+      //    drag-resize spans the FULL bbox (label area included), not just
+      //    the small visible glyph. Filled with rgba(0,0,0,0) — Konva still
+      //    counts the rect's area for hit-testing.
+      //  - Visible glyph (Rect for tickbox / Circle for radio / pill Rect
+      //    for toggle). Decorative — `listening: false` so clicks pass
+      //    through to the bbox rect.
+      //  - Inner mark depends on kind:
+      //      tickbox: white checkmark Path when checked
+      //      radio:   filled accent dot Circle when checked
+      //      toggle:  white handle Circle, position depends on `checked`
+      //               (right = on, left = off) — always rendered
+      // Splitting the visual into multiple nodes lets us paint bg, glyph,
+      // and inner mark in different colours — impossible from a single
+      // Konva.Path. Splitting the click target from the visual lets the
+      // multi-line label area drag-resize correctly.
+      (() => {
+        const isRadio = shape.kind === "radio";
+        const isToggle = shape.kind === "toggle";
+        const checked = !!shape.checked;
+        const accent = style.fillColor;
+        // Tickbox & toggle: filled accent bg when on, transparent off.
+        // Radio: never filled (only the inner dot signals state).
+        const glyphFill = checked && !isRadio ? accent : "transparent";
+        // Radio: always border colour (never accent — would camouflage on
+        // an accent-coloured background). Tickbox & toggle: accent ring
+        // when on, neutral when off — matches the filled state's vibe.
+        const glyphStroke = isRadio
+          ? style.borderEnabled
+            ? style.borderColor
+            : "#475569"
+          : checked
+            ? accent
+            : style.borderEnabled
+              ? style.borderColor
+              : "#94a3b8";
+        const glyphStrokeW = style.borderEnabled
+          ? style.borderWeight
+          : 1.5;
+        // Tickbox corner radius proportional to box; toggle uses a full
+        // pill (cornerRadius = h/2) so the ends are perfectly round.
+        const cornerR = isToggle
+          ? glyphRect.h / 2
+          : Math.max(2, Math.min(glyphRect.w, glyphRect.h) * 0.15);
+        const checkStrokeW = Math.max(2, glyphRect.h * 0.14);
+        // Radio geometry: the visible ring is a circle inscribed in the
+        // glyph rect. Center = glyph midpoint, radius = (min of w/h) / 2,
+        // accounting for stroke width so the outer edge doesn't get
+        // clipped by the bbox.
+        const rCx = shape.x + glyphRect.x + glyphRect.w / 2;
+        const rCy = shape.y + glyphRect.y + glyphRect.h / 2;
+        const rOuter = Math.max(
+          1,
+          Math.min(glyphRect.w, glyphRect.h) / 2 - glyphStrokeW / 2,
+        );
+        const rDot = rOuter * 0.55; // inner accent dot radius when checked
+        // Toggle handle geometry: a white circle that slides between two
+        // resting positions inside the pill. Radius hugs the pill height
+        // with a small inset so the handle reads as "inside the track".
+        const tInset = Math.max(2, glyphStrokeW + 1);
+        const tHandleR = Math.max(2, glyphRect.h / 2 - tInset);
+        const tHandleY = shape.y + glyphRect.y + glyphRect.h / 2;
+        const tHandleX = checked
+          ? shape.x + glyphRect.x + glyphRect.w - glyphRect.h / 2
+          : shape.x + glyphRect.x + glyphRect.h / 2;
+        return (
+          <>
+            <Rect
+              {...commonProps}
+              x={shape.x}
+              y={shape.y}
+              width={w}
+              height={h}
+              fill="rgba(0,0,0,0)"
+              stroke={undefined}
+              strokeWidth={0}
+            />
+            {isRadio ? (
+              <>
+                <Circle
+                  x={rCx}
+                  y={rCy}
+                  radius={rOuter}
+                  stroke={glyphStroke}
+                  strokeWidth={glyphStrokeW}
+                  fill="transparent"
+                  listening={false}
+                  rotation={shape.rotation ?? 0}
+                />
+                {checked && (
+                  <Circle
+                    x={rCx}
+                    y={rCy}
+                    radius={rDot}
+                    fill={accent}
+                    listening={false}
+                    rotation={shape.rotation ?? 0}
+                  />
+                )}
+              </>
+            ) : isToggle ? (
+              <>
+                <Rect
+                  x={shape.x + glyphRect.x}
+                  y={shape.y + glyphRect.y}
+                  width={glyphRect.w}
+                  height={glyphRect.h}
+                  cornerRadius={cornerR}
+                  fill={glyphFill}
+                  stroke={glyphStroke}
+                  strokeWidth={glyphStrokeW}
+                  listening={false}
+                  rotation={shape.rotation ?? 0}
+                />
+                <Circle
+                  x={tHandleX}
+                  y={tHandleY}
+                  radius={tHandleR}
+                  fill="#FFFFFF"
+                  stroke={
+                    checked
+                      ? "rgba(0,0,0,0.15)"
+                      : style.borderEnabled
+                        ? style.borderColor
+                        : "#94a3b8"
+                  }
+                  strokeWidth={checked ? 0.5 : 1}
+                  shadowColor="rgba(0,0,0,0.25)"
+                  shadowBlur={2}
+                  shadowOffsetY={1}
+                  listening={false}
+                  rotation={shape.rotation ?? 0}
+                />
+              </>
+            ) : (
+              <>
+                <Rect
+                  x={shape.x + glyphRect.x}
+                  y={shape.y + glyphRect.y}
+                  width={glyphRect.w}
+                  height={glyphRect.h}
+                  cornerRadius={cornerR}
+                  fill={glyphFill}
+                  stroke={glyphStroke}
+                  strokeWidth={glyphStrokeW}
+                  listening={false}
+                  rotation={shape.rotation ?? 0}
+                />
+                {checked && (
+                  <KPath
+                    x={shape.x + glyphRect.x}
+                    y={shape.y + glyphRect.y}
+                    data={
+                      `M ${glyphRect.w * 0.22} ${glyphRect.h * 0.52} ` +
+                      `L ${glyphRect.w * 0.43} ${glyphRect.h * 0.72} ` +
+                      `L ${glyphRect.w * 0.78} ${glyphRect.h * 0.3}`
+                    }
+                    stroke="#FFFFFF"
+                    strokeWidth={checkStrokeW}
+                    lineCap="round"
+                    lineJoin="round"
+                    listening={false}
+                    rotation={shape.rotation ?? 0}
+                  />
+                )}
+              </>
+            )}
+          </>
+        );
+      })()
     ) : (
       <KPath
         {...commonProps}
-        x={shape.x}
-        y={shape.y}
-        data={shapePathFor(shape.kind, w, h)}
+        x={shape.x + glyphRect.x}
+        y={shape.y + glyphRect.y}
+        data={shapePathFor(shape.kind, glyphRect.w, glyphRect.h, {
+          checked: shape.checked,
+          value: shape.value,
+          min: shape.min,
+          max: shape.max,
+        })}
       />
     );
 
@@ -5315,44 +6021,94 @@ function UnifiedShapeNode({
   const showText = !!text && text.text.length > 0 && !editing;
   const indentPx = (text?.indent ?? 0) * 16;
   const showBg = !!text && !!text.bgColor && !editing;
+  // For form controls with a label, the text positions over labelRect
+  // (vertically centered, left-aligned). Otherwise it fills the bbox the
+  // legacy way (centered text inside the shape).
+  const textRect = labelRect ?? { x: 0, y: 0, w, h };
   return (
     <Group>
       {node}
+      {labelRect && (
+        // Transparent click target over the label area so clicking the label
+        // also fires the form-control toggle. Without this, only the visible
+        // glyph captures the click and label clicks fall through to canvas.
+        <Rect
+          x={shape.x + labelRect.x}
+          y={shape.y + labelRect.y}
+          width={labelRect.w}
+          height={labelRect.h}
+          rotation={shape.rotation ?? 0}
+          opacity={0}
+          onClick={handleFormControlClick}
+          onTap={handleFormControlClick}
+          onDblClick={(e) => {
+            e.cancelBubble = true;
+            selectShapeAction(shape.id);
+            beginTextEdit(shape.id);
+          }}
+          onDblTap={(e) => {
+            e.cancelBubble = true;
+            selectShapeAction(shape.id);
+            beginTextEdit(shape.id);
+          }}
+        />
+      )}
       {showBg && (
         <Rect
-          x={shape.x}
-          y={shape.y}
-          width={w}
-          height={h}
+          x={shape.x + textRect.x}
+          y={shape.y + textRect.y}
+          width={textRect.w}
+          height={textRect.h}
           rotation={shape.rotation ?? 0}
           fill={text!.bgColor}
           listening={false}
         />
       )}
-      {showText && (
-        <Text
-          x={shape.x + 6 + indentPx}
-          y={shape.y + 6}
-          width={Math.max(1, w - 12 - indentPx)}
-          height={h - 12}
-          rotation={shape.rotation ?? 0}
-          text={formatListLines(
-            text!.text,
-            text!.bullets,
-            text!.indent ?? 0,
-            text!.bulletStyle,
-            text!.numberStyle,
-          )}
-          fontFamily={text!.font}
-          fontSize={text!.fontSize}
-          fontStyle={fontStyleFor(text!.bold, text!.italic)}
-          textDecoration={text!.underline ? "underline" : ""}
-          align={text!.align}
-          verticalAlign={text!.verticalAlign ?? "top"}
-          fill={text!.color}
-          listening={false}
-        />
-      )}
+      {showText &&
+        (labelRect ? (
+          // Form-control labels: keep the inline single-style Text. Form
+          // labels are short and single-run by design — going through
+          // RichTextRender's multi-run machinery for them would be wasted
+          // work, and the forced left/middle alignment + bullet-prefix
+          // formatting is part of the label contract, not the user's
+          // formatting choice.
+          <Text
+            x={shape.x + textRect.x + 6 + indentPx}
+            y={shape.y + textRect.y + 6}
+            width={Math.max(1, textRect.w - 12 - indentPx)}
+            height={textRect.h - 12}
+            rotation={shape.rotation ?? 0}
+            text={formatListLines(
+              text!.text,
+              text!.bullets,
+              text!.indent ?? 0,
+              text!.bulletStyle,
+              text!.numberStyle,
+            )}
+            fontFamily={text!.font}
+            fontSize={text!.fontSize}
+            fontStyle={fontStyleFor(text!.bold, text!.italic)}
+            textDecoration={text!.underline ? "underline" : ""}
+            align="left"
+            verticalAlign="middle"
+            fill={text!.color}
+            listening={false}
+          />
+        ) : (
+          // Standard text shapes route through RichTextRender so per-character
+          // marks (per-run font/size/color/bold/italic/underline/strike/
+          // highlight) actually render. RichTextRender takes the fast single-
+          // <Text> path when the doc is trivial (no marks → byte-identical
+          // to the legacy render), and the multi-run path when marks differ.
+          <RichTextRender
+            x={shape.x + textRect.x}
+            y={shape.y + textRect.y}
+            width={textRect.w}
+            height={textRect.h}
+            rotation={shape.rotation ?? 0}
+            text={text!}
+          />
+        ))}
     </Group>
   );
 }
@@ -5373,6 +6129,11 @@ function hitTest(sh: Shape, x: number, y: number): boolean {
   if (sh.type === "shape") {
     const w = sh.width;
     const h = sh.height;
+    return x >= sh.x && x <= sh.x + w && y >= sh.y && y <= sh.y + h;
+  }
+  if (sh.type === "table") {
+    const w = sh.colWidths.reduce((a, b) => a + b, 0);
+    const h = sh.rowHeights.reduce((a, b) => a + b, 0);
     return x >= sh.x && x <= sh.x + w && y >= sh.y && y <= sh.y + h;
   }
   if (sh.type === "line" || sh.type === "pen") {

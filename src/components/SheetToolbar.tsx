@@ -33,11 +33,21 @@ import {
   ArrowDown,
   ArrowLeft,
   ArrowRight,
+  ArrowLeftRight,
   Link2,
-  Group as GroupIcon,
-  Ungroup,
   Image as ImageIcon,
-  RotateCw,
+  Circle,
+  Triangle,
+  Hexagon,
+  Diamond,
+  Star,
+  Heart,
+  Cloud,
+  Move,
+  CheckSquare,
+  CircleDot,
+  ToggleRight,
+  SlidersHorizontal,
 } from "lucide-react";
 import type Konva from "konva";
 import { useStore } from "../store";
@@ -46,7 +56,10 @@ import type {
   Orientation,
   PaperSize,
   PenVariant,
+  RectShape,
   Shape,
+  ShapeKind,
+  ShapeStyle,
   Sheet,
   ShapeShape,
 } from "../types";
@@ -63,6 +76,7 @@ const TOOLBAR_HEIGHT = 38;
 
 export function SheetToolbar() {
   const tool = useStore((s) => s.tool);
+  const editingTextShapeId = useStore((s) => s.editingTextShapeId);
   const selectedShape = useStore((s) => {
     const id = s.selectedShapeId;
     if (!id) return null;
@@ -92,6 +106,13 @@ export function SheetToolbar() {
   // sticky so the generic ToolOptionsBar doesn't double up beneath it.
   if (tool === "pen") return null;
   if (selectedShape && selectedShape.type === "pen") return null;
+  // Tables own their own top-center bar (`TableFormatBar`) when a table is
+  // selected — yield the surface so the two don't stack. We don't bail for
+  // `tool === "table"` because the user is mid-drag-to-draw and there's no
+  // table-level config to surface yet; the picker is the dedicated UI for
+  // pre-create dimensions, and the rest of the canvas options are still
+  // useful while the tool is active.
+  if (selectedShape && selectedShape.type === "table") return null;
   // Shape draw tool gets a dedicated bar with fill / border / corners
   // controls bound to `shapeDefaults`. Without this the user would land in
   // the generic ToolOptionsBar fallback below, which has no rendering branch
@@ -104,7 +125,28 @@ export function SheetToolbar() {
   // sheet-level toolbar (paper size / background / margins / lock / hide /
   // more) is shown. Each contextual bar is its own complete toolkit — they
   // replace the sheet bar rather than stacking alongside it.
-  if (selectedShape && selectedShape.type === "shape")
+  // Text elements (transparent rectangle ShapeShapes with text) get the
+  // TextFormatBar instead of the rectangle toolkit when SELECTED. During
+  // active edit (`editingTextShapeId` set), we let ShapeOptionsBar render
+  // anyway so the user can stack-edit shape props while typing — per UX
+  // request: shape toolkit on top of text toolkit during double-click edit.
+  if (
+    !editingTextShapeId &&
+    selectedShape &&
+    selectedShape.type === "shape" &&
+    selectedShape.kind === "rectangle" &&
+    !!selectedShape.text &&
+    (selectedShape.style.fillOpacity ?? 1) === 0 &&
+    !selectedShape.style.borderEnabled
+  )
+    return null;
+  // Both the new ShapeShape and the legacy RectShape route to ShapeOptionsBar,
+  // which adapts internally — selecting any rect-like canvas object should
+  // surface the per-shape toolkit, never the sheet-level one.
+  if (
+    selectedShape &&
+    (selectedShape.type === "shape" || selectedShape.type === "rect")
+  )
     return <ShapeOptionsBar />;
   if (selectedShape && selectedShape.type === "image")
     return <ImageOptionsBar />;
@@ -3265,9 +3307,41 @@ type PopoverKey =
   | "borderColor"
   | "borderStyle"
   | "corners"
-  | "size"
-  | "rotation"
-  | "polygon";
+  | "polygon"
+  | "kind"
+  | "slider";
+
+// Same 4×4 layout the Toolbar's Shapes flyout uses — keep them in lockstep so
+// the kind-change picker in the inspector reads as the same surface the user
+// already learned. Order: basic → decorative → arrows+plus → form controls.
+const KIND_PICKER_ITEMS: ReadonlyArray<{
+  id: ShapeKind;
+  label: string;
+  icon: React.ReactNode;
+}> = [
+  { id: "rectangle", label: "Rectangle", icon: <Square size={14} /> },
+  { id: "ellipse", label: "Ellipse", icon: <Circle size={14} /> },
+  { id: "triangle", label: "Triangle", icon: <Triangle size={14} /> },
+  { id: "polygon", label: "Polygon", icon: <Hexagon size={14} /> },
+  { id: "diamond", label: "Diamond", icon: <Diamond size={14} /> },
+  { id: "star", label: "Star", icon: <Star size={14} /> },
+  { id: "heart", label: "Heart", icon: <Heart size={14} /> },
+  { id: "cloud", label: "Cloud", icon: <Cloud size={14} /> },
+  { id: "arrow-right", label: "Arrow", icon: <ArrowRight size={14} /> },
+  { id: "arrow-double", label: "Double Arrow", icon: <ArrowLeftRight size={14} /> },
+  { id: "arrow-quad", label: "Quad Arrow", icon: <Move size={14} /> },
+  { id: "plus", label: "Plus", icon: <Plus size={14} /> },
+  { id: "tickbox", label: "Tickbox", icon: <CheckSquare size={14} /> },
+  { id: "radio", label: "Radio", icon: <CircleDot size={14} /> },
+  { id: "toggle", label: "Toggle", icon: <ToggleRight size={14} /> },
+  { id: "slider", label: "Slider", icon: <SlidersHorizontal size={14} /> },
+];
+
+function kindMeta(kind: ShapeKind) {
+  return (
+    KIND_PICKER_ITEMS.find((k) => k.id === kind) ?? KIND_PICKER_ITEMS[0]
+  );
+}
 
 // ── Shape draw-mode bar ─────────────────────────────────────────────────────
 //
@@ -3502,18 +3576,59 @@ function ShapeToolOptionsBar() {
   );
 }
 
+/**
+ * Compact number input used inside the slider config popover (Value / Min /
+ * Max / Step). Kept local so the popover stays a single self-contained
+ * block — slider config is the only consumer at the moment.
+ */
+function SliderNumField({
+  label,
+  value,
+  min,
+  onChange,
+}: {
+  label: string;
+  value: number;
+  min?: number;
+  onChange: (n: number) => void;
+}) {
+  return (
+    <label className="flex items-center gap-1">
+      <span className="text-[10px] uppercase tracking-wider text-ink-400 w-9">
+        {label}
+      </span>
+      <input
+        type="number"
+        value={value}
+        min={min}
+        onChange={(e) => {
+          const n = Number(e.target.value);
+          if (!Number.isFinite(n)) return;
+          onChange(n);
+        }}
+        className="flex-1 h-7 px-1.5 text-xs rounded bg-ink-700 border border-ink-700 outline-none focus:border-brand-600 text-ink-100"
+      />
+    </label>
+  );
+}
+
 function ShapeOptionsBar() {
-  const editingTextShapeId = useStore((s) => s.editingTextShapeId);
-  const shape = useStore((s) => {
+  // Accept BOTH the new ShapeShape and the legacy RectShape. Selecting either
+  // should surface the same per-shape toolkit (the user said: "when selected
+  // on a shape, the shapes toolkit bar should come"). Legacy rects are
+  // adapted into a ShapeShape-shaped view via `shape` below; writes are
+  // translated back to the legacy `fill` / `stroke` / `strokeWidth` fields
+  // so the existing rect renderer keeps working.
+  const rawShape = useStore((s) => {
     const id = s.selectedShapeId;
     if (!id) return null;
     const sh = s.shapes.find((x) => x.id === id);
-    return sh && sh.type === "shape" ? (sh as ShapeShape) : null;
+    if (!sh) return null;
+    if (sh.type === "shape") return sh as ShapeShape;
+    if (sh.type === "rect") return sh as RectShape;
+    return null;
   });
   const updateShape = useStore((s) => s.updateShape);
-  const groupSelected = useStore((s) => s.groupSelected);
-  const ungroupSelected = useStore((s) => s.ungroupSelected);
-  const selectedShapeIds = useStore((s) => s.selectedShapeIds);
 
   const [open, setOpen] = useState<PopoverKey | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -3527,24 +3642,69 @@ function ShapeOptionsBar() {
     return () => document.removeEventListener("mousedown", onMd);
   }, [open]);
 
-  if (!shape) return null;
-  // While the text-edit overlay is active, defer to TextFormatBar so the
-  // shape options bar doesn't double up at the top.
-  if (editingTextShapeId) return null;
+  if (!rawShape) return null;
+  // ShapeOptionsBar stays mounted while the text-edit overlay is active so
+  // the user can still tweak fill / border / kind while typing. The
+  // TextFormatBar self-shifts down by ~46px when target.kind === "shape"
+  // so the two stack cleanly: shape bar on top, text bar directly below.
+
+  // Unify the two underlying schemas behind a single `shape` view so the
+  // rest of this component can treat them identically.
+  const isLegacyRect = rawShape.type === "rect";
+  const shape: ShapeShape = isLegacyRect
+    ? ({
+        ...(rawShape as RectShape),
+        type: "shape",
+        kind: "rectangle",
+        style: {
+          borderEnabled: !!(rawShape as RectShape).stroke,
+          borderWeight: (rawShape as RectShape).strokeWidth ?? 2,
+          borderColor: (rawShape as RectShape).stroke ?? "#2c2a27",
+          borderStyle: "solid",
+          // Legacy <Rect> renderer hardcodes cornerRadius=2 — surface that
+          // here so the bar's value matches what the user sees on canvas.
+          cornerRadius: 2,
+          fillColor: (rawShape as RectShape).fill ?? "#cccccc",
+          fillOpacity: 1,
+        },
+      } as ShapeShape)
+    : (rawShape as ShapeShape);
 
   const style = shape.style;
   const isRect = shape.kind === "rectangle";
   const isPolygon = shape.kind === "polygon";
   const sides = shape.polygonSides ?? 5;
-  // A group exists if 2+ are selected; ungroup applies if any selected has groupId.
-  const canGroup = selectedShapeIds.length >= 2;
-  const hasGroup = useStore.getState().shapes.some(
-    (sh) => selectedShapeIds.includes(sh.id) && sh.groupId
-  );
+  // Form-control kinds: per-kind state + slot detection so the bar can swap
+  // out the irrelevant Corners / Image-fill controls for Checked / Slider
+  // config / Label-text instead.
+  const isTickbox = shape.kind === "tickbox";
+  const isRadio = shape.kind === "radio";
+  const isToggle = shape.kind === "toggle";
+  const isSlider = shape.kind === "slider";
+  const isFormControl = isTickbox || isRadio || isToggle || isSlider;
+  const isCheckable = isTickbox || isRadio || isToggle;
 
-  function patchStyle(p: Partial<typeof style>) {
-    if (!shape) return;
-    updateShape(shape.id, { style: { ...style, ...p } } as Partial<Shape>);
+  function patchStyle(p: Partial<ShapeStyle>) {
+    if (!rawShape) return;
+    if (isLegacyRect) {
+      // Translate ShapeStyle patch keys back to the legacy RectShape fields
+      // the original renderer reads. Disabling the border clears stroke +
+      // strokeWidth so the rect renders with no outline.
+      const patch: Partial<RectShape> = {};
+      if (p.fillColor !== undefined) patch.fill = p.fillColor;
+      if (p.borderColor !== undefined) patch.stroke = p.borderColor;
+      if (p.borderWeight !== undefined) patch.strokeWidth = p.borderWeight;
+      if (p.borderEnabled === false) {
+        patch.stroke = undefined;
+        patch.strokeWidth = undefined;
+      }
+      updateShape(rawShape.id, patch as Partial<Shape>);
+    } else {
+      updateShape(
+        rawShape.id,
+        { style: { ...style, ...p } } as Partial<Shape>
+      );
+    }
   }
 
   function pickImage() {
@@ -3552,6 +3712,63 @@ function ShapeOptionsBar() {
       new CustomEvent("spaceshow:image-fill", { detail: { id: shape!.id } })
     );
   }
+
+  // Swap the shape's kind. For ShapeShapes it's a single field write. For
+  // legacy RectShape, this also performs a one-way migration to the unified
+  // ShapeShape schema (carrying width/height/x/y/rotation, deriving style
+  // from the legacy fill/stroke fields, dropping those legacy fields). After
+  // migration the underlying renderer (UnifiedShapeNode) takes over.
+  function changeKind(newKind: ShapeKind) {
+    if (!rawShape) return;
+    // Polygon-kind needs a sides count. Defer to the BottomBar inline
+    // prompt and run the migration inside the onSubmit callback so cancel
+    // is a true no-op (no kind change, no migration). Non-polygon kinds
+    // run through `applyKindChange` directly.
+    if (newKind === "polygon") {
+      const current = shape.polygonSides ?? 5;
+      const id = rawShape.id;
+      useStore.getState().beginPolygonSidesPrompt({
+        initial: current,
+        onSubmit: (n) => applyKindChange(id, "polygon", n),
+      });
+      setOpen(null);
+      return;
+    }
+    applyKindChange(rawShape.id, newKind, undefined);
+    setOpen(null);
+  }
+
+  // Splits the legacy-rect migration vs. plain-shape kind swap so both the
+  // synchronous (non-polygon) path and the deferred (polygon, post-prompt)
+  // path can share the same write. Resolves the underlying shape from the
+  // store on each call so the deferred path doesn't capture a stale closure
+  // of `rawShape`.
+  function applyKindChange(
+    id: string,
+    newKind: ShapeKind,
+    nextSides: number | undefined
+  ) {
+    const sh = useStore.getState().shapes.find((x) => x.id === id);
+    if (!sh) return;
+    if (sh.type === "rect") {
+      updateShape(id, {
+        type: "shape",
+        kind: newKind,
+        style,
+        polygonSides: newKind === "polygon" ? nextSides : undefined,
+        fill: undefined,
+        stroke: undefined,
+        strokeWidth: undefined,
+      } as Partial<Shape>);
+    } else {
+      updateShape(id, {
+        kind: newKind,
+        polygonSides: newKind === "polygon" ? nextSides : undefined,
+      } as Partial<Shape>);
+    }
+  }
+
+  const currentKindMeta = kindMeta(shape.kind);
 
   return (
     <div
@@ -3563,12 +3780,22 @@ function ShapeOptionsBar() {
         background: "var(--bg-secondary)",
       }}
     >
-      <div className="flex items-center gap-1.5 text-[11px] text-ink-200 whitespace-nowrap">
-        <span className="text-ink-400">
-          <Square size={13} />
+      {/* Shape name + kind picker. The label shows the user-facing shape name
+       *  (e.g. "Picture - A"); clicking opens a 4×4 grid that swaps the
+       *  shape's kind via `changeKind` (which migrates legacy rects too). */}
+      <button
+        onClick={() => setOpen(open === "kind" ? null : "kind")}
+        title="Change shape"
+        className={`flex items-center gap-1.5 h-7 px-2 rounded-md text-xs transition-colors ${
+          open === "kind" ? "row-active" : "hover:bg-ink-700 text-ink-200"
+        }`}
+      >
+        <span className="text-ink-400">{currentKindMeta.icon}</span>
+        <span className="font-medium max-w-[160px] truncate">
+          {shape.name?.trim() || currentKindMeta.label}
         </span>
-        <span className="font-medium">{capitalize(shape.kind)}</span>
-      </div>
+        <ChevronDown size={11} />
+      </button>
 
       <Divider />
 
@@ -3600,23 +3827,28 @@ function ShapeOptionsBar() {
         <ChevronDown size={11} />
       </button>
 
-      {/* Corner radius (rectangle only) */}
-      <button
-        disabled={!isRect}
-        onClick={() => isRect && setOpen(open === "corners" ? null : "corners")}
-        title={isRect ? "Corner radius" : "Corner radius (rectangle only)"}
-        className={`flex items-center gap-1.5 h-7 px-2 rounded-md text-xs transition-colors ${
-          !isRect
-            ? "opacity-40 cursor-not-allowed text-ink-300"
-            : open === "corners"
-            ? "row-active"
-            : "hover:bg-ink-700 text-ink-200"
-        }`}
-      >
-        <span>Corners</span>
-        <span className="tabular-nums">{Math.round(style.cornerRadius)}</span>
-        <ChevronDown size={11} />
-      </button>
+      {/* Corner radius (rectangle only). Hidden entirely for form controls
+          since cornerRadius doesn't apply to their composite paths. */}
+      {!isFormControl && (
+        <button
+          disabled={!isRect}
+          onClick={() =>
+            isRect && setOpen(open === "corners" ? null : "corners")
+          }
+          title={isRect ? "Corner radius" : "Corner radius (rectangle only)"}
+          className={`flex items-center gap-1.5 h-7 px-2 rounded-md text-xs transition-colors ${
+            !isRect
+              ? "opacity-40 cursor-not-allowed text-ink-300"
+              : open === "corners"
+              ? "row-active"
+              : "hover:bg-ink-700 text-ink-200"
+          }`}
+        >
+          <span>Corners</span>
+          <span className="tabular-nums">{Math.round(style.cornerRadius)}</span>
+          <ChevronDown size={11} />
+        </button>
+      )}
 
       {/* Polygon sides */}
       {isPolygon && (
@@ -3633,67 +3865,117 @@ function ShapeOptionsBar() {
         </button>
       )}
 
+      {/* Form-control state: a checkable's on/off as a Switch on the bar
+          itself (one-click toggle without opening a popover) plus a Label
+          text input for all four kinds. Slider gets a dedicated config
+          popover with Value / Min / Max / Step / Track / Handle controls. */}
+      {isCheckable && (
+        <div className="flex items-center gap-1.5 h-7 px-2 rounded-md text-xs text-ink-200">
+          <span className="text-ink-300">
+            {isToggle ? "On" : "Checked"}
+          </span>
+          <Switch
+            checked={!!shape.checked}
+            onChange={(v) => {
+              if (isRadio && v) {
+                useStore.getState().setRadioChecked(rawShape!.id);
+              } else {
+                useStore.getState().setShapeChecked(rawShape!.id, v);
+              }
+            }}
+          />
+        </div>
+      )}
+      {isSlider && (
+        <button
+          onClick={() => setOpen(open === "slider" ? null : "slider")}
+          title="Slider value, range, step, colours"
+          className={`flex items-center gap-1.5 h-7 px-2 rounded-md text-xs transition-colors ${
+            open === "slider" ? "row-active" : "hover:bg-ink-700 text-ink-200"
+          }`}
+        >
+          <span>Value</span>
+          <span className="tabular-nums">
+            {Math.round(
+              shape.value ?? ((shape.min ?? 0) + (shape.max ?? 100)) / 2
+            )}
+          </span>
+          <ChevronDown size={11} />
+        </button>
+      )}
+      {isFormControl && (
+        <input
+          type="text"
+          value={shape.text?.text ?? ""}
+          onChange={(e) =>
+            updateShape(rawShape!.id, {
+              text: {
+                ...(shape.text ?? {
+                  font: "Inter",
+                  fontSize: 14,
+                  color: "#1f2937",
+                  bold: false,
+                  italic: false,
+                  underline: false,
+                  align: "left",
+                  bullets: "none",
+                  indent: 0,
+                  autoFit: false,
+                }),
+                text: e.target.value,
+              },
+            } as Partial<Shape>)
+          }
+          placeholder="Label text…"
+          className="h-7 px-2 text-xs rounded bg-ink-700 border border-ink-700 outline-none focus:border-brand-600 text-ink-100 w-40"
+        />
+      )}
+
       <Divider />
 
-      {/* Size + rotation */}
-      <button
-        onClick={() => setOpen(open === "size" ? null : "size")}
-        title="Position & size"
-        className={`flex items-center gap-1.5 h-7 px-2 rounded-md text-xs transition-colors ${
-          open === "size" ? "row-active" : "hover:bg-ink-700 text-ink-200"
-        }`}
-      >
-        <span className="tabular-nums">
-          {Math.round(shape.width)}×{Math.round(shape.height)}
-        </span>
-        <ChevronDown size={11} />
-      </button>
-
-      <button
-        onClick={() => setOpen(open === "rotation" ? null : "rotation")}
-        title="Rotation"
-        className={`flex items-center gap-1.5 h-7 px-2 rounded-md text-xs transition-colors ${
-          open === "rotation" ? "row-active" : "hover:bg-ink-700 text-ink-200"
-        }`}
-      >
-        <RotateCw size={12} />
-        <span className="tabular-nums">{Math.round(shape.rotation ?? 0)}°</span>
-      </button>
-
-      {/* Image fill */}
-      <button
-        onClick={pickImage}
-        title="Fill with image"
-        className="flex items-center gap-1.5 h-7 px-2 rounded-md text-xs transition-colors hover:bg-ink-700 text-ink-200"
-      >
-        <ImageIcon size={13} />
-      </button>
-
-      <Divider />
-
-      {/* Group / Ungroup */}
-      <button
-        disabled={!canGroup}
-        onClick={() => groupSelected()}
-        title="Group (Ctrl/Cmd+G)"
-        className={`flex items-center gap-1.5 h-7 px-2 rounded-md text-xs transition-colors ${
-          canGroup ? "hover:bg-ink-700 text-ink-200" : "opacity-40 cursor-not-allowed text-ink-300"
-        }`}
-      >
-        <GroupIcon size={13} />
-      </button>
-      <button
-        disabled={!hasGroup}
-        onClick={() => ungroupSelected()}
-        title="Ungroup (Ctrl/Cmd+Shift+G)"
-        className={`flex items-center gap-1.5 h-7 px-2 rounded-md text-xs transition-colors ${
-          hasGroup ? "hover:bg-ink-700 text-ink-200" : "opacity-40 cursor-not-allowed text-ink-300"
-        }`}
-      >
-        <Ungroup size={13} />
-      </button>
+      {/* Image fill — hidden for form controls (no meaningful image-on-tickbox
+          interpretation). */}
+      {!isFormControl && (
+        <button
+          onClick={pickImage}
+          title="Fill with image"
+          className="flex items-center gap-1.5 h-7 px-2 rounded-md text-xs transition-colors hover:bg-ink-700 text-ink-200"
+        >
+          <ImageIcon size={13} />
+        </button>
+      )}
 
       {/* Popovers */}
+      {open === "kind" && (
+        <div
+          className="absolute top-full mt-2 left-0 z-30 panel rounded-md shadow-2xl p-2 w-[224px]"
+          style={{ background: "var(--bg-secondary)" }}
+          onMouseDown={(e) => e.stopPropagation()}
+        >
+          <div className="text-[10px] uppercase tracking-wider text-ink-400 mb-2 px-1">
+            Change shape
+          </div>
+          <div className="grid grid-cols-4 gap-1">
+            {KIND_PICKER_ITEMS.map((item) => {
+              const isCurrent = item.id === shape.kind;
+              return (
+                <button
+                  key={item.id}
+                  onClick={() => changeKind(item.id)}
+                  title={item.label}
+                  className={`h-10 rounded grid place-items-center transition-colors ${
+                    isCurrent
+                      ? "row-active text-ink-100"
+                      : "hover:bg-ink-700 text-ink-200"
+                  }`}
+                >
+                  {item.icon}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
       {open === "fill" && (
         <div
           className="absolute top-full mt-2 left-0 z-30 panel rounded-md shadow-2xl p-3 w-64"
@@ -3838,7 +4120,7 @@ function ShapeOptionsBar() {
             <input
               type="range"
               min={3}
-              max={12}
+              max={20}
               step={1}
               value={sides}
               onChange={(e) =>
@@ -3855,120 +4137,74 @@ function ShapeOptionsBar() {
         </div>
       )}
 
-      {open === "size" && (
+      {open === "slider" && isSlider && (
         <div
-          className="absolute top-full mt-2 left-0 z-30 panel rounded-md shadow-2xl p-3 w-72"
+          className="absolute top-full mt-2 left-0 z-30 panel rounded-md shadow-2xl p-3 w-72 space-y-3"
           style={{ background: "var(--bg-secondary)" }}
           onMouseDown={(e) => e.stopPropagation()}
         >
-          <div className="text-[10px] uppercase tracking-wider text-ink-400 mb-2">
-            Position &amp; size
+          <div>
+            <div className="text-[10px] uppercase tracking-wider text-ink-400 mb-2">
+              Range &amp; value
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <SliderNumField
+                label="Value"
+                value={shape.value ?? Math.round(((shape.min ?? 0) + (shape.max ?? 100)) / 2)}
+                onChange={(n) =>
+                  useStore.getState().setSliderValue(rawShape!.id, n)
+                }
+              />
+              <SliderNumField
+                label="Step"
+                value={shape.step ?? 1}
+                min={0}
+                onChange={(n) =>
+                  updateShape(rawShape!.id, { step: Math.max(0, n) } as Partial<Shape>)
+                }
+              />
+              <SliderNumField
+                label="Min"
+                value={shape.min ?? 0}
+                onChange={(n) =>
+                  updateShape(rawShape!.id, { min: n } as Partial<Shape>)
+                }
+              />
+              <SliderNumField
+                label="Max"
+                value={shape.max ?? 100}
+                onChange={(n) =>
+                  updateShape(rawShape!.id, { max: n } as Partial<Shape>)
+                }
+              />
+            </div>
           </div>
-          <div className="grid grid-cols-2 gap-2">
-            <NumField
-              label="X"
-              value={Math.round(shape.x)}
-              onChange={(n) => updateShape(shape.id, { x: n } as Partial<Shape>)}
-            />
-            <NumField
-              label="Y"
-              value={Math.round(shape.y)}
-              onChange={(n) => updateShape(shape.id, { y: n } as Partial<Shape>)}
-            />
-            <NumField
-              label="W"
-              value={Math.round(shape.width)}
-              min={3}
-              onChange={(n) =>
-                updateShape(shape.id, { width: Math.max(3, n) } as Partial<Shape>)
+          <div>
+            <div className="text-[10px] uppercase tracking-wider text-ink-400 mb-1">
+              Track colour
+            </div>
+            <ColorPickerPanel
+              value={shape.trackColor ?? style.fillColor}
+              onChange={(c) =>
+                updateShape(rawShape!.id, { trackColor: c } as Partial<Shape>)
               }
             />
-            <NumField
-              label="H"
-              value={Math.round(shape.height)}
-              min={3}
-              onChange={(n) =>
-                updateShape(shape.id, { height: Math.max(3, n) } as Partial<Shape>)
+          </div>
+          <div>
+            <div className="text-[10px] uppercase tracking-wider text-ink-400 mb-1">
+              Handle colour
+            </div>
+            <ColorPickerPanel
+              value={shape.handleColor ?? style.fillColor}
+              onChange={(c) =>
+                updateShape(rawShape!.id, { handleColor: c } as Partial<Shape>)
               }
             />
           </div>
         </div>
       )}
 
-      {open === "rotation" && (
-        <div
-          className="absolute top-full mt-2 left-0 z-30 panel rounded-md shadow-2xl p-3 w-56"
-          style={{ background: "var(--bg-secondary)" }}
-          onMouseDown={(e) => e.stopPropagation()}
-        >
-          <div className="text-[10px] uppercase tracking-wider text-ink-400 mb-2">
-            Rotation
-          </div>
-          <div className="flex items-center gap-2">
-            <button
-              className="h-7 px-2 rounded text-xs hover:bg-ink-700 text-ink-200"
-              onClick={() =>
-                updateShape(shape.id, {
-                  rotation: ((shape.rotation ?? 0) - 15) % 360,
-                } as Partial<Shape>)
-              }
-            >
-              −15°
-            </button>
-            <NumField
-              label=""
-              value={Math.round(shape.rotation ?? 0)}
-              onChange={(n) =>
-                updateShape(shape.id, { rotation: n % 360 } as Partial<Shape>)
-              }
-            />
-            <button
-              className="h-7 px-2 rounded text-xs hover:bg-ink-700 text-ink-200"
-              onClick={() =>
-                updateShape(shape.id, {
-                  rotation: ((shape.rotation ?? 0) + 15) % 360,
-                } as Partial<Shape>)
-              }
-            >
-              +15°
-            </button>
-          </div>
-        </div>
-      )}
     </div>
-  );
-}
-
-function NumField({
-  label,
-  value,
-  min,
-  onChange,
-}: {
-  label: string;
-  value: number;
-  min?: number;
-  onChange: (n: number) => void;
-}) {
-  return (
-    <label className="flex items-center gap-1">
-      {label && (
-        <span className="text-[10px] uppercase tracking-wider text-ink-400 w-4">
-          {label}
-        </span>
-      )}
-      <input
-        type="number"
-        value={value}
-        min={min}
-        onChange={(e) => {
-          const n = Number(e.target.value);
-          if (!Number.isFinite(n)) return;
-          onChange(n);
-        }}
-        className="flex-1 h-7 px-1.5 text-xs rounded bg-ink-700 border border-ink-700 outline-none focus:border-brand-600 text-ink-100"
-      />
-    </label>
   );
 }
 

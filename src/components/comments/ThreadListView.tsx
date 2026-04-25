@@ -12,7 +12,7 @@ export function ThreadListView() {
   const threads = useStore((s) => s.threads);
   const comments = useStore((s) => s.comments);
   const attachments = useStore((s) => s.attachments);
-  const setActiveThread = useStore((s) => s.setActiveThread);
+  const focusThread = useStore((s) => s.focusThread);
   const setHoverThreadId = useStore((s) => s.setHoverThreadId);
   const hoverThreadId = useStore((s) => s.hoverThreadId);
 
@@ -21,7 +21,7 @@ export function ThreadListView() {
   if (ordered.length === 0) {
     return (
       <div className="flex-1 overflow-y-auto scroll-thin p-4 text-center text-xs text-ink-400">
-        No comments yet. Press{" "}
+        Press{" "}
         <kbd className="px-1 py-0.5 rounded bg-ink-800 text-ink-200 text-[10px]">
           C
         </kbd>{" "}
@@ -51,7 +51,12 @@ export function ThreadListView() {
           <button
             key={t.id}
             type="button"
-            onClick={() => setActiveThread(t.id)}
+            // `focusThread` switches sheet (if needed), pans/zooms the
+            // canvas to bring the pin into view, and sets the active
+            // thread so the ThreadPopover mounts at the (now visible)
+            // pin. If the pin's already comfortably onscreen the camera
+            // doesn't move — see store.ts.
+            onClick={() => focusThread(t.id)}
             onMouseEnter={() => setHoverThreadId(t.id)}
             onMouseLeave={() => setHoverThreadId(null)}
             className={`w-full text-left px-3 py-2.5 border-b border-ink-800 transition-colors ${

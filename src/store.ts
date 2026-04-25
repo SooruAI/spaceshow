@@ -1,11 +1,11 @@
 import { create } from "zustand";
 import type { Editor as TipTapEditor } from "@tiptap/react";
+import { screenAnchorForThread } from "./lib/comments";
 import type {
   Attachment,
   Board,
   BulletStyle,
   Comment,
-  CommentsView,
   EditingTextTarget,
   EraserVariant,
   Guide,
@@ -25,6 +25,7 @@ import type {
   SheetBorder,
   Shape,
   ShapeKind,
+  ShapeShape,
   ShapeStyle,
   Thread,
   TipTapDoc,
@@ -34,6 +35,12 @@ import type {
 } from "./types";
 import { paperToPx } from "./lib/paperSizes";
 import { DEFAULT_TEXT_FONT } from "./lib/fonts";
+import {
+  getStoredViewMode,
+  setStoredViewMode,
+  type ViewMode,
+} from "./lib/viewMode";
+import { clampSlidePan, rotatedAabb } from "./lib/slidePan";
 
 const uid = (p = "id") => `${p}_${Math.random().toString(36).slice(2, 9)}`;
 
@@ -606,9 +613,12 @@ interface State {
   showComments: boolean;
   /** Right rail showing the Versions panel. Mutex with showComments / showRightSidebar. */
   showVersions: boolean;
-  /** Whether the sidebar is showing the thread list or a single thread. */
-  commentsView: CommentsView;
-  /** Focused thread id. Invariant: null ⇔ commentsView === "list". */
+  /**
+   * Focused thread id. When non-null AND `showComments` is true, the
+   * Canvas mounts `<ThreadPopover />` anchored to that thread's pin.
+   * Cleared automatically by `openRightPanel(null)` so closing the rail
+   * always dismisses any open popover.
+   */
   activeThreadId: string | null;
   /** Hovered pin/row — drives cross-highlight between canvas + sidebar. */
   hoverThreadId: string | null;
@@ -655,6 +665,14 @@ interface State {
   gridGap: number;
   showSettings: boolean;
   showProfile: boolean;
+  /** Editor workspace mode. "slide" centers one sheet at a time
+   *  (PowerPoint/Canva-style); "board" shows the infinity board. Persisted
+   *  to localStorage via lib/viewMode.ts. */
+  viewMode: ViewMode;
+  /** Snapshot of the user's pan/zoom from the last time they were in board
+   *  mode. Restored on slide → board switch so the view doesn't jump. Null
+   *  means "no prior board state — fall back to fitAllSheets". */
+  boardViewport: { pan: { x: number; y: number }; zoom: number } | null;
   // tool config (used by drawing tools)
   toolColors: Record<string, string>;
   /** Stroke width for new line/shape drawings, in WORLD pixels. Scales with
@@ -698,6 +716,33 @@ interface State {
   // shape sub-tool — drives the next created ShapeShape
   shapeKind: ShapeKind;
   shapeDefaults: ShapeStyle;
+  /** Sides count used for the next polygon-kind shape drawn (or set via the
+   *  inspector kind dropdown). 3–20 inclusive — validated at the entry
+   *  points (Toolbar shape picker, ShapeOptionsBar.changeKind). */
+  defaultPolygonSides: number;
+  /** Inline polygon-sides prompt — when non-null the BottomBar swaps its
+   *  default content for an input row that asks the user how many sides
+   *  the next polygon should have. The caller supplies submit + optional
+   *  cancel callbacks so the store stays decoupled from the action that
+   *  triggered the prompt (start a draw, swap a selected shape's kind,
+   *  …). Replaces an earlier window.prompt() flow per UX request. */
+  polygonSidesPrompt: {
+    initial: number;
+    onSubmit: (n: number) => void;
+    onCancel?: () => void;
+  } | null;
+  // table tool — remembered grid size (set by the picker, used by drag-to-draw
+  // when the user creates a table without re-opening the picker).
+  tableDims: { rows: number; cols: number };
+  // table defaults — applied to every newly created TableShape.
+  tableDefaults: {
+    defaultColWidth: number;
+    defaultRowHeight: number;
+    borderColor: string;
+    borderWeight: number;
+    borderStyle: "solid" | "dashed" | "dotted";
+    headerRowBg: string;
+  };
   // text-edit overlay — non-null while a shape's in-shape text is being edited.
   // `editingText` is the canonical state and supports both ShapeShape `text`
   // and StickyShape `header`/`body`. `editingTextShapeId` is a back-compat
@@ -756,6 +801,16 @@ interface State {
   duplicateBoard: () => void;
   setActiveSheet: (id: string) => void;
   selectSheet: (id: string | null) => void;
+  /** Switch the editor between slide and board view modes. Persists choice
+   *  to localStorage and restores/snapshots board pan+zoom across switches. */
+  setViewMode: (m: ViewMode) => void;
+  /** Slide-mode navigation primitive: setActiveSheet + animated zoomToSheet
+   *  in one call. Use this when jumping to a specific slide so the viewport
+   *  always re-fits. In board mode this still works (just animates the fit). */
+  gotoSlide: (id: string) => void;
+  /** Move N slides forward (delta=+1) or back (delta=-1) from the current
+   *  active slide. Skips hidden sheets. Clamps at first/last (no wrap). */
+  gotoSlideByOffset: (delta: 1 | -1) => void;
   addSheet: () => void;
   insertSheetAfter: (id: string) => void;
   duplicateSheet: (id: string) => void;
@@ -855,9 +910,15 @@ interface State {
   setShowHamburger: (b: boolean) => void;
   setShowIterationDropdown: (b: boolean) => void;
   setShowComments: (b: boolean) => void;
-  setCommentsView: (v: CommentsView) => void;
-  /** Setting a non-null id auto-switches to focused view. Null returns to list. */
+  /** Set the focused thread; null dismisses the popover. */
   setActiveThread: (id: string | null) => void;
+  /**
+   * Open a thread by id from outside the canvas (e.g., a list-row click).
+   * Switches sheet if the pin lives on a different one, recenters the
+   * camera if the pin is currently offscreen, and sets the active thread
+   * so `<ThreadPopover />` mounts at the pin.
+   */
+  focusThread: (threadId: string) => void;
   setHoverThreadId: (id: string | null) => void;
   clearPendingFocus: () => void;
   /** Drop a new pin. Returns the new threadId. Creates an empty thread — the
@@ -1001,6 +1062,36 @@ interface State {
   swapLineMarkers: () => void;
   setShapeKind: (k: ShapeKind) => void;
   setShapeDefaults: (patch: Partial<ShapeStyle>) => void;
+  /** Set the next-polygon sides count. Caller is responsible for clamping
+   *  to 3–20; the store just stores. */
+  setDefaultPolygonSides: (n: number) => void;
+  /** Open the inline BottomBar polygon-sides prompt. The current value (if
+   *  any) seeds the input. Replaces any active prompt — at most one is open
+   *  at a time. */
+  beginPolygonSidesPrompt: (p: {
+    initial?: number;
+    onSubmit: (n: number) => void;
+    onCancel?: () => void;
+  }) => void;
+  /** Dismiss the prompt without invoking either callback. Use when the
+   *  caller wants to clear UI without firing onCancel (e.g. the prompt
+   *  was already submitted). */
+  endPolygonSidesPrompt: () => void;
+  // ── Form-control state setters ────────────────────────────────────────
+  /** Set `checked` on a tickbox/toggle ShapeShape. Thin wrapper over
+   *  updateShape — exposed as a named action so call sites read clearly
+   *  ("toggle this control") and a future history coalesce key can
+   *  attach without changing every call site. */
+  setShapeChecked: (id: string, checked: boolean) => void;
+  /** Set the named radio's `checked: true` AND clear `checked` on every
+   *  other radio on the same sheet (group-by-sheet exclusivity). Wraps
+   *  the multi-shape mutation in a single history entry so undo restores
+   *  the whole group state, not just the picked radio. */
+  setRadioChecked: (id: string) => void;
+  /** Set a slider's `value` clamped to [min, max] and snapped to `step`.
+   *  Defaults: min=0, max=100, step=1. */
+  setSliderValue: (id: string, value: number) => void;
+  setTableDims: (rows: number, cols: number) => void;
   /** Enter in-shape text-edit mode. Accepts either a bare shape id (legacy
    *  shorthand for `{ kind: "shape", id }`) or an `EditingTextTarget` for
    *  sticky header/body editing. */
@@ -1303,8 +1394,9 @@ export const useStore = create<State>((set, get) => ({
   users: defaultUsers,
   currentUserId: "user_me",
   showComments: false,
+  // (Note: the previous `commentsView` field was removed — the sidebar is
+  // always a list now; per-thread detail moved into `<ThreadPopover />`.)
   showVersions: false,
-  commentsView: "list" as CommentsView,
   activeThreadId: null,
   hoverThreadId: null,
   pendingFocusThreadId: null,
@@ -1325,6 +1417,8 @@ export const useStore = create<State>((set, get) => ({
   gridGap: 50,
   showSettings: false,
   showProfile: false,
+  viewMode: getStoredViewMode(),
+  boardViewport: null,
   toolColors: {
     pen: "#2c2a27",
     rect: "#0d9488",
@@ -1338,6 +1432,7 @@ export const useStore = create<State>((set, get) => ({
     sticky: "#fef3c7",
     text: "#2c2a27",
     shape: "#0d9488",
+    table: "#ffffff",
   },
   toolStrokeWidth: 3,
   toolFontSize: 14,
@@ -1367,6 +1462,17 @@ export const useStore = create<State>((set, get) => ({
   lineOpacity: 1,
   shapeKind: "rectangle",
   shapeDefaults: defaultShapeStyle(),
+  defaultPolygonSides: 5,
+  polygonSidesPrompt: null,
+  tableDims: { rows: 3, cols: 3 },
+  tableDefaults: {
+    defaultColWidth: 120,
+    defaultRowHeight: 36,
+    borderColor: "#d4d4d8",
+    borderWeight: 1,
+    borderStyle: "solid",
+    headerRowBg: "#f4f4f5",
+  },
   editingText: null,
   editingTextShapeId: null,
   activeRichTextEditor: null,
@@ -1389,16 +1495,63 @@ export const useStore = create<State>((set, get) => ({
   setPresentationName: (name) => set({ presentationName: name }),
   setTool: (t) => set({ tool: t }),
   setZoom: (z) => set({ zoom: Math.min(4, Math.max(0.05, z)) }),
-  setPan: (p) => set({ pan: p }),
-  panBy: (dx, dy) =>
-    set((s) => ({ pan: { x: s.pan.x + dx, y: s.pan.y + dy } })),
+  setPan: (p) => {
+    const s = get();
+    if (s.viewMode !== "slide") {
+      set({ pan: p });
+      return;
+    }
+    // Slide mode: hard-clamp pan to the active slide's rotated bbox (with a
+    // small gutter). The user can pan within the slide for detail editing
+    // but cannot reach another slide by panning — that's strictly via Prev/
+    // Next, keyboard, or the LeftSidebar Sheets tab.
+    set({
+      pan: clampSlidePan(
+        p,
+        s.sheets,
+        s.activeSheetId,
+        s.zoom,
+        s.viewportSize.w,
+        s.viewportSize.h,
+      ),
+    });
+  },
+  panBy: (dx, dy) => {
+    const s = get();
+    const target = { x: s.pan.x + dx, y: s.pan.y + dy };
+    if (s.viewMode !== "slide") {
+      set({ pan: target });
+      return;
+    }
+    set({
+      pan: clampSlidePan(
+        target,
+        s.sheets,
+        s.activeSheetId,
+        s.zoom,
+        s.viewportSize.w,
+        s.viewportSize.h,
+      ),
+    });
+  },
   zoomAt: (factor, cx, cy) => {
-    const { zoom, pan } = get();
+    const s = get();
+    const { zoom, pan } = s;
     const newZoom = Math.min(4, Math.max(0.05, zoom * factor));
     // keep cx/cy as world-space invariant
     const worldX = (cx - pan.x) / zoom;
     const worldY = (cy - pan.y) / zoom;
-    const newPan = { x: cx - worldX * newZoom, y: cy - worldY * newZoom };
+    let newPan = { x: cx - worldX * newZoom, y: cy - worldY * newZoom };
+    if (s.viewMode === "slide") {
+      newPan = clampSlidePan(
+        newPan,
+        s.sheets,
+        s.activeSheetId,
+        newZoom,
+        s.viewportSize.w,
+        s.viewportSize.h,
+      );
+    }
     set({ zoom: newZoom, pan: newPan });
   },
   // Only write when either dimension actually changes — the ResizeObserver
@@ -1430,6 +1583,64 @@ export const useStore = create<State>((set, get) => ({
       activeSheetId: id,
       expandedSheets: { ...s.expandedSheets, [id]: true },
     })),
+  setViewMode: (m) => {
+    const s = get();
+    if (s.viewMode === m) return;
+    setStoredViewMode(m);
+    if (m === "slide") {
+      // Save current board pan/zoom so we can restore it on the way back.
+      // The Canvas useEffect on (viewMode, activeSheetId) will refit the
+      // active sheet — no need to call zoomToSheet here.
+      set({
+        viewMode: "slide",
+        boardViewport: { pan: s.pan, zoom: s.zoom },
+      });
+      return;
+    }
+    // m === "board": restore the snapshot if we have one, otherwise fit all
+    // sheets so the user lands on something sensible instead of an arbitrary
+    // pan/zoom inherited from slide-mode auto-fit.
+    if (s.boardViewport) {
+      set({
+        viewMode: "board",
+        pan: s.boardViewport.pan,
+        zoom: s.boardViewport.zoom,
+        boardViewport: null,
+      });
+    } else {
+      set({ viewMode: "board", boardViewport: null });
+      const { viewportSize, fitAllSheets } = get();
+      if (viewportSize.w > 0 && viewportSize.h > 0) {
+        fitAllSheets(viewportSize.w, viewportSize.h);
+      }
+    }
+  },
+  gotoSlide: (id) => {
+    const s = get();
+    const sheet = s.sheets.find((x) => x.id === id);
+    if (!sheet) return;
+    // Just flip activeSheetId — the Canvas slide-mode auto-fit effect picks
+    // up the change and runs zoomToSheet. Keeping the fit in one place
+    // (the effect) means we don't double-animate when both this action AND
+    // the effect would have called zoomToSheet.
+    s.setActiveSheet(id);
+  },
+  gotoSlideByOffset: (delta) => {
+    const s = get();
+    // Insertion order — same order as the LeftSidebar Sheets tab, where the
+    // user reorders via drag. Slide mode is a navigation overlay; it doesn't
+    // derive nav order from the spatial layout.
+    const visible = s.sheets.filter((sh) => !sh.hidden);
+    if (visible.length === 0) return;
+    const curIdx = visible.findIndex((sh) => sh.id === s.activeSheetId);
+    // If active is hidden/unknown, treat -1 as "before first" and +1 as
+    // "after first" so the user lands on the first visible slide either
+    // way (no wrap — just clamp at the edges).
+    const base = curIdx < 0 ? (delta > 0 ? -1 : visible.length) : curIdx;
+    const next = Math.max(0, Math.min(visible.length - 1, base + delta));
+    if (next === curIdx) return;
+    s.gotoSlide(visible[next].id);
+  },
   selectSheet: (id) =>
     set({
       selectedSheetId: id,
@@ -1514,6 +1725,29 @@ export const useStore = create<State>((set, get) => ({
         locked: false,
         hidden: false,
       };
+      // Slide mode is a navigation overlay — it must not reflow the spatial
+      // layout. Insert the new sheet right AFTER the active one in the array
+      // (matches the LeftSidebar Sheets tab order) and place it next to the
+      // active slide so it isn't stacked on top in board view. Other sheets
+      // keep their (x, y) untouched.
+      if (s.viewMode === "slide") {
+        const active = s.sheets.find((sh) => sh.id === s.activeSheetId);
+        if (active) {
+          newSheet.x = active.x + active.width + SHEET_GAP;
+          newSheet.y = active.y;
+          const idx = s.sheets.findIndex((sh) => sh.id === active.id);
+          const arr = [...s.sheets];
+          arr.splice(idx + 1, 0, newSheet);
+          return {
+            sheets: arr,
+            activeSheetId: newSheet.id,
+            selectedSheetId: newSheet.id,
+            expandedSheets: { ...s.expandedSheets, [newSheet.id]: true },
+          };
+        }
+        // No active sheet — fall through to row-append so the first slide
+        // still lands somewhere sensible.
+      }
       return {
         sheets: layoutSheetsRow([...s.sheets, newSheet]),
         activeSheetId: newSheet.id,
@@ -2118,9 +2352,53 @@ export const useStore = create<State>((set, get) => ({
   // Comment actions intentionally do NOT call pushHistory — resolving or
   // replying to a comment should not be reverted by Cmd+Z on a layout change.
   setShowComments: (b) => set({ showComments: b }),
-  setCommentsView: (v) => set({ commentsView: v }),
-  setActiveThread: (id) =>
-    set({ activeThreadId: id, commentsView: id ? "focused" : "list" }),
+  setActiveThread: (id) => set({ activeThreadId: id }),
+  focusThread: (threadId) => {
+    const st = get();
+    const thread = st.threads.find((t) => t.id === threadId);
+    if (!thread) return;
+
+    // 1. Switch to the pin's sheet if it lives on a different one. (Board
+    //    pins skip this — they have no sheet.)
+    if (
+      thread.canvasId !== "board" &&
+      thread.canvasId !== st.activeSheetId
+    ) {
+      st.setActiveSheet(thread.canvasId);
+    }
+
+    // 2. Compute the pin's current screen position via the shared helper
+    //    so the popover (which uses the same helper to anchor itself)
+    //    agrees with our recenter math byte-for-byte.
+    const { wx, wy, sx, sy } = screenAnchorForThread(
+      thread,
+      st.sheets,
+      { zoom: st.zoom, pan: st.pan }
+    );
+
+    // 3. Recenter the camera only if the pin is currently offscreen.
+    //    Already-visible pins skip the move so the camera doesn't jump
+    //    on every list-row click.
+    const onscreen =
+      sx > 16 &&
+      sx < window.innerWidth - 16 &&
+      sy > 16 &&
+      sy < window.innerHeight - 16;
+    if (!onscreen) {
+      // Don't zoom out further than the user already chose; only zoom in
+      // if they're below ~60% (where pins are uncomfortably tiny anyway).
+      const targetZoom = Math.max(st.zoom, 0.6);
+      const targetPanX = window.innerWidth / 2 - wx * targetZoom;
+      const targetPanY = window.innerHeight / 2 - wy * targetZoom;
+      set({
+        zoom: targetZoom,
+        pan: { x: targetPanX, y: targetPanY },
+      });
+    }
+
+    // 4. Set the active thread — popover mounts at the (now visible) pin.
+    set({ activeThreadId: threadId });
+  },
   setHoverThreadId: (id) => set({ hoverThreadId: id }),
   clearPendingFocus: () => set({ pendingFocusThreadId: null }),
   addThread: ({ canvasId, coordinates }) => {
@@ -2189,8 +2467,6 @@ export const useStore = create<State>((set, get) => ({
         comments: s.comments.filter((c) => c.threadId !== id),
         attachments: s.attachments.filter((a) => !commentIds.has(a.commentId)),
         activeThreadId: s.activeThreadId === id ? null : s.activeThreadId,
-        commentsView:
-          s.activeThreadId === id ? "list" : s.commentsView,
       };
     }),
   deleteComment: (id) =>
@@ -2208,8 +2484,6 @@ export const useStore = create<State>((set, get) => ({
           attachments: s.attachments.filter((a) => !commentIds.has(a.commentId)),
           activeThreadId:
             s.activeThreadId === target.threadId ? null : s.activeThreadId,
-          commentsView:
-            s.activeThreadId === target.threadId ? "list" : s.commentsView,
         };
       }
       return {
@@ -2226,11 +2500,11 @@ export const useStore = create<State>((set, get) => ({
       showComments: id === "comments",
       showRightSidebar: id === "views",
       showVersions: id === "versions",
-      // Collapsing a focused thread back to list is the friendlier default when
-      // closing and re-opening — keeps users oriented in the list overview.
-      ...(id !== "comments"
-        ? { activeThreadId: null, commentsView: "list" as CommentsView }
-        : {}),
+      // Closing the comments rail dismisses any open thread popover too —
+      // the popover is gated on `showComments && activeThreadId`, and
+      // clearing the id here also handles the `activeThreadId` lingering
+      // case if some other surface re-opens the rail later.
+      ...(id !== "comments" ? { activeThreadId: null } : {}),
     }),
   restoreVersion: (id) => {
     const s = get();
@@ -2391,6 +2665,62 @@ export const useStore = create<State>((set, get) => ({
   setShapeKind: (k) => set({ shapeKind: k }),
   setShapeDefaults: (patch) =>
     set((s) => ({ shapeDefaults: { ...s.shapeDefaults, ...patch } })),
+  setDefaultPolygonSides: (n) => set({ defaultPolygonSides: n }),
+  beginPolygonSidesPrompt: ({ initial, onSubmit, onCancel }) =>
+    set((s) => ({
+      polygonSidesPrompt: {
+        initial: initial ?? s.defaultPolygonSides,
+        onSubmit,
+        onCancel,
+      },
+    })),
+  endPolygonSidesPrompt: () => set({ polygonSidesPrompt: null }),
+  // ── Form-control state setters ────────────────────────────────────────
+  setShapeChecked: (id, checked) => {
+    // Routed through updateShape so undo/redo + history coalesce + dirty
+    // tracking are handled the same way every other shape mutation is.
+    get().updateShape(id, { checked } as Partial<Shape>);
+  },
+  setRadioChecked: (id) => {
+    // Group-by-sheet exclusivity: clicking one radio sets it `checked` and
+    // clears every other radio on the same sheet. Mutate the `shapes` array
+    // in a single set() so the whole transition lands as one history entry
+    // (undo restores the prior group state in one keystroke).
+    const target = get().shapes.find((s) => s.id === id);
+    if (!target || target.type !== "shape") return;
+    const ts = target as ShapeShape;
+    if (ts.kind !== "radio") return;
+    const sheetId = ts.sheetId;
+    pushHistory();
+    set((s) => ({
+      shapes: s.shapes.map((sh) => {
+        if (sh.type !== "shape") return sh;
+        const ss = sh as ShapeShape;
+        if (ss.kind !== "radio") return sh;
+        if (ss.sheetId !== sheetId) return sh;
+        if (ss.id === id) {
+          return ss.checked ? ss : ({ ...ss, checked: true } as Shape);
+        }
+        return ss.checked ? ({ ...ss, checked: false } as Shape) : sh;
+      }),
+    }));
+  },
+  setSliderValue: (id, value) => {
+    const sh = get().shapes.find((s) => s.id === id);
+    if (!sh || sh.type !== "shape") return;
+    const ss = sh as ShapeShape;
+    if (ss.kind !== "slider") return;
+    const min = ss.min ?? 0;
+    const max = ss.max ?? 100;
+    const step = ss.step ?? 1;
+    const clamped = Math.max(min, Math.min(max, value));
+    // Snap to step relative to min so steps align to the range floor.
+    const snapped =
+      step > 0 ? min + Math.round((clamped - min) / step) * step : clamped;
+    get().updateShape(id, { value: snapped } as Partial<Shape>);
+  },
+  setTableDims: (rows, cols) =>
+    set({ tableDims: { rows: Math.max(1, rows), cols: Math.max(1, cols) } }),
   beginTextEdit: (target) => {
     // Accept either a bare id (legacy) or a discriminated EditingTextTarget.
     const t: EditingTextTarget =
@@ -3031,6 +3361,16 @@ export const useStore = create<State>((set, get) => ({
         sheetId: s.activeSheetId,
       } as Shape;
     }
+    // Stickies are canvas-level — same coercion that `addShape` /
+    // `updateShape` enforce. Without this, pasting a sticky (right-click
+    // → Paste OR Cmd+V) lands it on the active sheet, but Canvas only
+    // partitions board-layer shapes into the always-on-top render pass,
+    // so the sticky silently disappears (or renders in a wrong layer
+    // and behaves oddly under selection). Belt-and-braces — any future
+    // paste path is now safe by construction.
+    if (copy.type === "sticky" && copy.sheetId !== "board") {
+      copy = { ...copy, sheetId: "board" } as Shape;
+    }
     // Same reason as `duplicateShape`: Canvas's transformer prefers
     // `selectedShapeIds` over the singular field, so we have to replace
     // the plural list or the highlight stays on whatever was selected
@@ -3424,10 +3764,14 @@ export const useStore = create<State>((set, get) => ({
     // intentionally uses the tighter 120px because its job is the opposite —
     // cram every sheet onto the screen.
     const padding = 240;
-    const scale = Math.min(
-      (vw - padding) / sheet.width,
-      (vh - padding) / sheet.height,
-    );
+    // Use the rotated AABB so a 45°-rotated sheet still fits inside the
+    // viewport (without rotation accounting, the corners would clip).
+    // Center coords are rotation-invariant since Konva rotates around the
+    // sheet center, so we only need to adjust the size.
+    const aabb = rotatedAabb(sheet);
+    const fitW = aabb.maxX - aabb.minX;
+    const fitH = aabb.maxY - aabb.minY;
+    const scale = Math.min((vw - padding) / fitW, (vh - padding) / fitH);
     const targetZ = Math.min(4, Math.max(0.05, scale));
     const targetPan = {
       x: vw / 2 - (sheet.x + sheet.width / 2) * targetZ,

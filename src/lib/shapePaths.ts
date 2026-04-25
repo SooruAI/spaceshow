@@ -17,10 +17,10 @@ export const KIND_RENDERER: Record<ShapeKind, ShapeRenderer> = {
   star: "star",
   heart: "path",
   cloud: "path",
-  "arrow-left": "path",
   "arrow-right": "path",
-  "arrow-up": "path",
-  "arrow-down": "path",
+  "arrow-double": "path",
+  "arrow-quad": "path",
+  plus: "path",
   tickbox: "path",
   radio: "path",
   toggle: "path",
@@ -31,11 +31,26 @@ export const KIND_RENDERER: Record<ShapeKind, ShapeRenderer> = {
  * Build an SVG path `d` string for a path-based shape kind, scaled to
  * (w, h). Coordinates are local to the shape — the caller positions the
  * Konva.Path node via x/y. All paths are closed with "Z".
+ *
+ * `opts` carries form-control state used by tickbox / radio / toggle /
+ * slider. Defaults preserve the original "always set / centered" silhouette
+ * so existing data renders unchanged when the caller doesn't pass any state.
  */
+export interface ShapePathOpts {
+  /** tickbox / radio / toggle: whether the control is on. */
+  checked?: boolean;
+  /** slider: current value. Defaults to midpoint of [min, max]. */
+  value?: number;
+  /** slider: range floor. Defaults to 0. */
+  min?: number;
+  /** slider: range ceiling. Defaults to 100. */
+  max?: number;
+}
 export function shapePathFor(
   kind: ShapeKind,
   w: number,
-  h: number
+  h: number,
+  opts?: ShapePathOpts
 ): string {
   const W = Math.max(1, w);
   const H = Math.max(1, h);
@@ -73,38 +88,46 @@ export function shapePathFor(
       );
     }
     case "tickbox": {
-      // Square outline + check mark inside (drawn as a single path).
+      // Square outline always; checkmark sub-path only when `opts.checked`.
+      // Empty-checked silhouette reads as an unticked checkbox; ticked adds
+      // the diagonal stroke.
       const pad = 1;
-      return (
+      const outline =
         `M ${pad} ${pad} L ${W - pad} ${pad} L ${W - pad} ${H - pad} ` +
-        `L ${pad} ${H - pad} Z ` +
+        `L ${pad} ${H - pad} Z`;
+      if (!opts?.checked) return outline;
+      return (
+        `${outline} ` +
         `M ${W * 0.22} ${H * 0.5} L ${W * 0.45} ${H * 0.72} ` +
         `L ${W * 0.78} ${H * 0.28}`
       );
     }
     case "radio": {
-      // Outer disc (CW) + middle disc (CCW) + center dot (CW). Counter-winding
-      // the middle so the default canvas nonzero fill rule paints a ring +
-      // dot — no need to bolt fill-rule="evenodd" onto Konva.Path.
+      // Outer disc (CW) + middle disc (CCW) draws the empty ring. Center dot
+      // (CW) is appended only when `opts.checked` so the default silhouette
+      // is an unselected radio. Counter-winding still drives nonzero fill so
+      // the ring renders as a ring (not a solid disc).
       const cx = W / 2;
       const cy = H / 2;
       const R = Math.min(W, H) / 2;
       const ringInner = R * 0.65;   // inner cutout radius — controls ring thickness
       const dot = R * 0.32;          // center dot radius
-      return (
+      const ring =
         `M ${cx - R} ${cy} A ${R} ${R} 0 1 1 ${cx + R} ${cy} ` +
         `A ${R} ${R} 0 1 1 ${cx - R} ${cy} Z ` +
         `M ${cx - ringInner} ${cy} A ${ringInner} ${ringInner} 0 1 0 ${cx + ringInner} ${cy} ` +
-        `A ${ringInner} ${ringInner} 0 1 0 ${cx - ringInner} ${cy} Z ` +
+        `A ${ringInner} ${ringInner} 0 1 0 ${cx - ringInner} ${cy} Z`;
+      if (!opts?.checked) return ring;
+      return (
+        `${ring} ` +
         `M ${cx - dot} ${cy} A ${dot} ${dot} 0 1 1 ${cx + dot} ${cy} ` +
         `A ${dot} ${dot} 0 1 1 ${cx - dot} ${cy} Z`
       );
     }
     case "toggle": {
-      // Stadium pill (CW) with a counter-wound handle disc on the right that
-      // subtracts a circular hole. Reads as a toggle in any combination of
-      // fill / stroke styling: outline-only shows pill + handle ring; filled
-      // shows a solid pill with the handle's silhouette punched through.
+      // Stadium pill (CW) with a counter-wound handle disc that subtracts a
+      // circular hole. Handle sits on the LEFT when off, RIGHT when on — the
+      // classic switch animation captured as two static positions.
       const radius = H / 2;
       const outer =
         `M ${radius} 0 H ${W - radius} ` +
@@ -112,7 +135,7 @@ export function shapePathFor(
         `H ${radius} ` +
         `A ${radius} ${radius} 0 0 1 ${radius} 0 Z`;
       const handleR = radius * 0.7;
-      const hcx = W - radius;
+      const hcx = opts?.checked ? W - radius : radius;
       const hcy = H / 2;
       // CCW handle (sweep=0) → cut a hole via nonzero fill rule.
       const handle =
@@ -122,14 +145,22 @@ export function shapePathFor(
       return `${outer} ${handle}`;
     }
     case "slider": {
-      // Thin horizontal track (stadium) plus a larger handle disc at the
-      // midpoint. Both wound CW so they're additive — the handle bulges
-      // above and below the track and reads as the slider thumb.
+      // Thin horizontal track (stadium) plus a handle disc whose x-position
+      // reflects `opts.value` interpolated across [min, max]. Default value
+      // (no opts) keeps the handle centered to match the historic silhouette.
       const trackH = Math.max(2, H * 0.22);
       const trackY = (H - trackH) / 2;
       const trackR = trackH / 2;
       const handleR = Math.min(H * 0.46, W * 0.18);
-      const hcx = W / 2;
+      const min = opts?.min ?? 0;
+      const max = opts?.max ?? 100;
+      const range = max - min;
+      const value =
+        opts?.value !== undefined ? opts.value : (min + max) / 2;
+      const frac =
+        range === 0 ? 0.5 : Math.max(0, Math.min(1, (value - min) / range));
+      // Constrain hcx so the handle never spills past the bbox edges.
+      const hcx = handleR + frac * (W - 2 * handleR);
       const hcy = H / 2;
       const track =
         `M ${trackR} ${trackY} H ${W - trackR} ` +
@@ -152,34 +183,64 @@ export function shapePathFor(
         `L ${W - headW} ${shaftY2} L 0 ${shaftY2} Z`
       );
     }
-    case "arrow-left": {
-      const headW = Math.min(W * 0.35, H * 0.5);
+    case "arrow-double": {
+      // Horizontal double-headed arrow: tips at (0, H/2) and (W, H/2),
+      // shaft of thickness 0.3·H between them, flared head bases at each end.
+      const headW = Math.min(W * 0.25, H * 0.5);
       const shaftY1 = H * 0.35;
       const shaftY2 = H * 0.65;
       return (
-        `M ${W} ${shaftY1} L ${headW} ${shaftY1} ` +
-        `L ${headW} 0 L 0 ${H / 2} L ${headW} ${H} ` +
-        `L ${headW} ${shaftY2} L ${W} ${shaftY2} Z`
+        `M 0 ${H / 2} ` +
+        `L ${headW} 0 L ${headW} ${shaftY1} ` +
+        `L ${W - headW} ${shaftY1} L ${W - headW} 0 ` +
+        `L ${W} ${H / 2} ` +
+        `L ${W - headW} ${H} L ${W - headW} ${shaftY2} ` +
+        `L ${headW} ${shaftY2} L ${headW} ${H} Z`
       );
     }
-    case "arrow-up": {
-      const headH = Math.min(H * 0.35, W * 0.5);
-      const shaftX1 = W * 0.35;
-      const shaftX2 = W * 0.65;
+    case "arrow-quad": {
+      // 4-pointed arrow (cross with arrowheads at every tip). Heads sit on
+      // the cardinal axes, shafts meet in a square at the center, head bases
+      // flare beyond the shaft thickness so the silhouette reads as arrows
+      // rather than a plus.
+      const headW = Math.min(W * 0.25, H * 0.5);   // horizontal head depth
+      const headH = Math.min(H * 0.25, W * 0.5);   // vertical head depth
+      const shaftY1 = H * 0.4;
+      const shaftY2 = H * 0.6;
+      const shaftX1 = W * 0.4;
+      const shaftX2 = W * 0.6;
+      const headTopY = H * 0.3;     // horizontal head base top (flared)
+      const headBotY = H * 0.7;     // horizontal head base bottom (flared)
+      const headLeftX = W * 0.3;    // vertical head base left (flared)
+      const headRightX = W * 0.7;   // vertical head base right (flared)
       return (
-        `M ${shaftX1} ${H} L ${shaftX1} ${headH} ` +
-        `L 0 ${headH} L ${W / 2} 0 L ${W} ${headH} ` +
-        `L ${shaftX2} ${headH} L ${shaftX2} ${H} Z`
+        // start at left tip, traverse clockwise
+        `M 0 ${H / 2} ` +
+        `L ${headW} ${headTopY} L ${headW} ${shaftY1} ` +
+        `L ${shaftX1} ${shaftY1} L ${shaftX1} ${headH} ` +
+        `L ${headLeftX} ${headH} L ${W / 2} 0 L ${headRightX} ${headH} ` +
+        `L ${shaftX2} ${headH} L ${shaftX2} ${shaftY1} ` +
+        `L ${W - headW} ${shaftY1} L ${W - headW} ${headTopY} ` +
+        `L ${W} ${H / 2} ` +
+        `L ${W - headW} ${headBotY} L ${W - headW} ${shaftY2} ` +
+        `L ${shaftX2} ${shaftY2} L ${shaftX2} ${H - headH} ` +
+        `L ${headRightX} ${H - headH} L ${W / 2} ${H} L ${headLeftX} ${H - headH} ` +
+        `L ${shaftX1} ${H - headH} L ${shaftX1} ${shaftY2} ` +
+        `L ${headW} ${shaftY2} L ${headW} ${headBotY} Z`
       );
     }
-    case "arrow-down": {
-      const headH = Math.min(H * 0.35, W * 0.5);
-      const shaftX1 = W * 0.35;
-      const shaftX2 = W * 0.65;
+    case "plus": {
+      // 12-vertex plus / cross: vertical bar of width 0.3·W meets horizontal
+      // bar of height 0.3·H at the center. Even arms in both directions.
+      const sx1 = W * 0.35;
+      const sx2 = W * 0.65;
+      const sy1 = H * 0.35;
+      const sy2 = H * 0.65;
       return (
-        `M ${shaftX1} 0 L ${shaftX1} ${H - headH} ` +
-        `L 0 ${H - headH} L ${W / 2} ${H} L ${W} ${H - headH} ` +
-        `L ${shaftX2} ${H - headH} L ${shaftX2} 0 Z`
+        `M ${sx1} 0 L ${sx2} 0 L ${sx2} ${sy1} ` +
+        `L ${W} ${sy1} L ${W} ${sy2} L ${sx2} ${sy2} ` +
+        `L ${sx2} ${H} L ${sx1} ${H} L ${sx1} ${sy2} ` +
+        `L 0 ${sy2} L 0 ${sy1} L ${sx1} ${sy1} Z`
       );
     }
     default:
@@ -199,10 +260,10 @@ export const KIND_LABEL: Record<ShapeKind, string> = {
   star: "Star",
   heart: "Heart",
   cloud: "Cloud",
-  "arrow-left": "Arrow Left",
-  "arrow-right": "Arrow Right",
-  "arrow-up": "Arrow Up",
-  "arrow-down": "Arrow Down",
+  "arrow-right": "Arrow",
+  "arrow-double": "Double Arrow",
+  "arrow-quad": "Quad Arrow",
+  plus: "Plus",
   tickbox: "Tickbox",
   radio: "Radio",
   toggle: "Toggle",

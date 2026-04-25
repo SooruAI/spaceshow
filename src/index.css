@@ -134,6 +134,43 @@
     background: color-mix(in srgb, var(--accent) 12%, transparent);
     color: var(--text-primary);
   }
+  /* Format-bar buttons render this when the user's selection in a rich-text
+     editor spans values for the underlying mark — e.g. some chars bold and
+     some not. Half the tint of `row-active` so it reads as "indeterminate"
+     vs. "on", and a small dot in the corner to drive the meaning home. */
+  .row-mixed {
+    background: color-mix(in srgb, var(--accent) 6%, transparent);
+    color: var(--text-primary);
+    position: relative;
+  }
+  .row-mixed::after {
+    content: "";
+    position: absolute;
+    right: 3px;
+    top: 3px;
+    width: 4px;
+    height: 4px;
+    border-radius: 50%;
+    background: var(--accent);
+    opacity: 0.7;
+  }
+  /* Suppress Tiptap-native list markers during edit. The manual gutter in
+     TextEditOverlay paints the canonical glyphs (matching the Konva render);
+     showing the browser's <ul>/<ol> disc on top would produce double markers. */
+  .tiptap-edit-content {
+    line-height: 1.2;
+    outline: none;
+  }
+  .tiptap-edit-content ul,
+  .tiptap-edit-content ol {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+  }
+  /* Tiptap's TextAlign extension writes data-text-align on paragraphs. */
+  .tiptap-edit-content [data-text-align="center"]  { text-align: center; }
+  .tiptap-edit-content [data-text-align="right"]   { text-align: right; }
+  .tiptap-edit-content [data-text-align="justify"] { text-align: justify; }
   /* Drag-reorder affordance for sidebar rows. Hover = grab; during a drag the
      <body> gets [data-dragging] so the grabbing cursor shows everywhere and the
      source row fades to 40% so the insertion line can breathe. */

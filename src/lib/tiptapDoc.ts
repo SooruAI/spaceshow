@@ -347,6 +347,97 @@ export function migrateTextContent(t: TextContent): TextContent {
   };
 }
 
+/** Caller-facing alias for the lazy-migrate-on-edit pattern: hand a TextContent,
+ *  get a usable Tiptap doc back. Returns the existing `doc` when present and
+ *  non-empty; otherwise builds one from flat fields via `migrateTextContent`.
+ *
+ *  Used by the rich-text edit overlay at mount time — Tiptap needs an actual
+ *  doc to seed the editor, and legacy/fresh shapes only carry flat fields.
+ *
+ *  Note: this does NOT write the migrated doc back to the store. The first
+ *  edit's `onUpdate` will flow through `applyDoc` and persist the doc then.
+ *  Calling `ensureDoc` repeatedly on the same TextContent is safe and cheap. */
+export function ensureDoc(t: TextContent): TipTapDoc {
+  if (t.doc && hasDocContent(t.doc)) return t.doc;
+  // migrateTextContent always produces a non-undefined doc when called on a
+  // TextContent without one. The `!` is safe because of the lazy-build path
+  // in migrateTextContent (returns the same `t` only if doc was already set,
+  // which we've just ruled out).
+  return migrateTextContent(t).doc!;
+}
+
+/** Sticky-body migration shim. Sticky notes have a long-standing visual cue
+ *  where the FIRST line of the body is rendered as a 24px bold "title". With
+ *  per-character styling that cue used to be implicit (the renderer special-
+ *  cased line 0); now it's just a pair of marks on the first text run.
+ *
+ *  When a legacy sticky (no doc, multi-line plain text) opens for edit, build
+ *  the doc inline so line 0 carries `bold` + `textStyle.fontSize=24` while the
+ *  rest pick up the body's flat-field font size. This preserves visual
+ *  continuity for existing data without forcing users to manually re-bold +
+ *  re-size their existing titles after migration.
+ *
+ *  Idempotent: returns `t.doc` unchanged when one already exists. New stickies
+ *  also flow through here so the cue persists for fresh notes too. */
+export function ensureStickyBodyDoc(t: TextContent): TipTapDoc {
+  if (t.doc && hasDocContent(t.doc)) return t.doc;
+
+  const text = t.text ?? "";
+  const lines = text.split("\n");
+
+  // Body's flat-field font size becomes the "rest" size. Default 12 matches
+  // the legacy sticky body default.
+  const bodyFontSize = typeof t.fontSize === "number" ? t.fontSize : 12;
+  const TITLE_FONT_SIZE = 24;
+
+  function makeTitleMarks(): Mark[] {
+    const m: Mark[] = [{ type: "bold" }];
+    const styleAttrs: Record<string, unknown> = { fontSize: TITLE_FONT_SIZE };
+    if (t.color) styleAttrs.color = t.color;
+    if (t.font) styleAttrs.fontFamily = t.font;
+    m.push({ type: "textStyle", attrs: styleAttrs });
+    return m;
+  }
+  function makeBodyMarks(): Mark[] {
+    const m: Mark[] = [];
+    if (t.bold) m.push({ type: "bold" });
+    if (t.italic) m.push({ type: "italic" });
+    if (t.underline) m.push({ type: "underline" });
+    if (t.strike) m.push({ type: "strike" });
+    const styleAttrs: Record<string, unknown> = { fontSize: bodyFontSize };
+    if (t.color) styleAttrs.color = t.color;
+    if (t.font) styleAttrs.fontFamily = t.font;
+    m.push({ type: "textStyle", attrs: styleAttrs });
+    return m;
+  }
+
+  // Empty sticky: emit a single empty paragraph so Tiptap has something to
+  // mount onto. We don't pre-mark an empty run with title styling because
+  // there's no text to carry the marks; the editor's storedMarks will pick
+  // up the right size when the user starts typing the title (driven by the
+  // format bar's defaults at edit start).
+  if (lines.length === 0 || (lines.length === 1 && lines[0] === "")) {
+    return { type: "doc", content: [{ type: "paragraph" }] };
+  }
+
+  const blocks: Node[] = lines.map((line, i) => {
+    const marks = i === 0 ? makeTitleMarks() : makeBodyMarks();
+    const para: Node = { type: "paragraph" };
+    if (line.length > 0) {
+      para.content = [
+        {
+          type: "text",
+          text: line,
+          marks: marks.map((m) => ({ ...m })),
+        },
+      ];
+    }
+    return para;
+  });
+
+  return { type: "doc", content: blocks };
+}
+
 /** Idempotent helper: produce the next TextContent given a new doc. Atomically
  *  updates `doc`, recomputes `text`, refreshes the flat-field snapshot. Call
  *  this from every place that mutates `doc` — Tiptap onUpdate handlers, paste

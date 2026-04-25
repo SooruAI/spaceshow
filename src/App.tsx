@@ -12,12 +12,14 @@ import { BottomBar } from "./components/BottomBar";
 import { CommentsSidebar } from "./components/comments/CommentsSidebar";
 import { VersionsSidebar } from "./components/versions/VersionsSidebar";
 import { SpacePresent } from "./components/SpacePresent";
+import { SlideNavigator } from "./components/SlideNavigator";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { ProfilePanel } from "./components/ProfilePanel";
 import { ShortcutsCheatsheet } from "./components/ShortcutsCheatsheet";
 import { TextEditOverlay } from "./components/TextEditOverlay";
 import { TextFormatBar } from "./components/TextFormatBar";
 import { StickyFormatBar } from "./components/StickyFormatBar";
+import { TableFormatBar } from "./components/table/TableFormatBar";
 import { ContextMenu } from "./components/ContextMenu";
 import { Toast } from "./components/Toast";
 import { useStore } from "./store";
@@ -37,6 +39,7 @@ export default function App() {
   const setShowLeftSidebar = useStore((s) => s.setShowLeftSidebar);
   const showRightSidebar = useStore((s) => s.showRightSidebar);
   const openRightPanel = useStore((s) => s.openRightPanel);
+  const viewMode = useStore((s) => s.viewMode);
 
   const canvasWrapRef = useRef<HTMLDivElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -204,8 +207,9 @@ export default function App() {
               SelectionToolbar stays unmounted on purpose — ContextMenu
               already covers its action set. */}
           <StickyFormatBar />
+          <TableFormatBar />
           <TextFormatBar />
-          <FloatingAddSheet />
+          {viewMode === "slide" ? <SlideNavigator /> : <FloatingAddSheet />}
         </div>
         {showComments && <CommentsSidebar />}
         {showVersions && <VersionsSidebar />}

@@ -1,8 +1,6 @@
 import {
-  ArrowDown,
-  ArrowLeft,
+  ArrowLeftRight,
   ArrowRight,
-  ArrowUp,
   Brush,
   CheckSquare,
   Circle,
@@ -16,7 +14,9 @@ import {
   Hexagon,
   Highlighter,
   MousePointer2,
+  Move,
   Pen,
+  Plus,
   Shapes,
   SlidersHorizontal,
   Square,
@@ -37,6 +37,7 @@ import type {
   LineRouting,
 } from "../types";
 import { LINE_ROUTING_META } from "./lineTool/routingIcons";
+import { TableToolButton } from "./table/TableToolButton";
 
 const TOOLS: { id: Tool; label: string; icon: React.ReactNode }[] = [
   { id: "select", label: "Select (V)", icon: <MousePointer2 size={16} /> },
@@ -91,11 +92,11 @@ const SHAPE_KINDS: {
   { id: "star", label: "Star", icon: <Star size={16} /> },
   { id: "heart", label: "Heart", icon: <Heart size={16} /> },
   { id: "cloud", label: "Cloud", icon: <Cloud size={16} /> },
-  // Row 3 — arrows (L, R, Up, Down — matches D-pad / arrow-key layout in a row)
-  { id: "arrow-left", label: "Arrow Left", icon: <ArrowLeft size={16} /> },
-  { id: "arrow-right", label: "Arrow Right", icon: <ArrowRight size={16} /> },
-  { id: "arrow-up", label: "Arrow Up", icon: <ArrowUp size={16} /> },
-  { id: "arrow-down", label: "Arrow Down", icon: <ArrowDown size={16} /> },
+  // Row 3 — arrows + plus (single → double → quad → plus, complexity ascends)
+  { id: "arrow-right", label: "Arrow", icon: <ArrowRight size={16} /> },
+  { id: "arrow-double", label: "Double-headed Arrow", icon: <ArrowLeftRight size={16} /> },
+  { id: "arrow-quad", label: "Four-way Arrow", icon: <Move size={16} /> },
+  { id: "plus", label: "Plus", icon: <Plus size={16} /> },
   // Row 4 — form controls
   { id: "tickbox", label: "Tickbox", icon: <CheckSquare size={16} /> },
   { id: "radio", label: "Radio Button", icon: <CircleDot size={16} /> },
@@ -129,6 +130,7 @@ export function Toolbar({ onUploadClick }: { onUploadClick: () => void }) {
       <EraserToolButton />
       <ShapesToolButton />
       <LineToolButton />
+      <TableToolButton />
       {TOOLS.filter((t) => t.id !== "select").map((t) => (
         <button
           key={t.id}
@@ -292,6 +294,9 @@ function ShapesToolButton() {
   const setTool = useStore((s) => s.setTool);
   const shapeKind = useStore((s) => s.shapeKind);
   const setShapeKind = useStore((s) => s.setShapeKind);
+  const defaultPolygonSides = useStore((s) => s.defaultPolygonSides);
+  const setDefaultPolygonSides = useStore((s) => s.setDefaultPolygonSides);
+  const beginPolygonSidesPrompt = useStore((s) => s.beginPolygonSidesPrompt);
 
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -362,6 +367,23 @@ function ShapesToolButton() {
   }
 
   function pickKind(k: ShapeKind) {
+    // Polygon needs a sides count up front. The BottomBar shows an inline
+    // input (driven by `polygonSidesPrompt` store state); on submit we
+    // store the count + activate the polygon draw tool, on cancel we just
+    // close the picker without changing tools.
+    if (k === "polygon") {
+      beginPolygonSidesPrompt({
+        initial: defaultPolygonSides,
+        onSubmit: (n) => {
+          setDefaultPolygonSides(n);
+          setTool("shape");
+          setShapeKind("polygon");
+        },
+      });
+      clearTimers();
+      closeTimer.current = window.setTimeout(() => setOpen(false), 150);
+      return;
+    }
     setTool("shape");
     setShapeKind(k);
     clearTimers();

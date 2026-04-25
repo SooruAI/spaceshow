@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useStore } from "../store";
 import { RULER_SIZE } from "./Rulers";
 import type {
@@ -6,12 +6,24 @@ import type {
   Shape,
   ShapeShape,
   StickyShape,
+  TableShape,
   TextContent,
+  TipTapDoc,
 } from "../types";
 import { DEFAULT_TEXT_FONT } from "../lib/fonts";
 import { listPrefixFor } from "../lib/listFormat";
+import { cellBBox, replaceCell } from "../lib/tableLayout";
+import {
+  FORM_CONTROL_GLYPH_CAP,
+  computeFormControlLayout,
+} from "../lib/shapeLayout";
+import { applyDoc, ensureDoc, ensureStickyBodyDoc } from "../lib/tiptapDoc";
+import { RichTextEditor } from "./RichTextEditor";
 
-const MAX_INDENT = 6;
+// MAX_INDENT was used by the legacy textarea's Tab handler; now indent is
+// driven through the rich-text editor (sinkListItem / liftListItem) and the
+// flat-field clamp lives in TextFormatBar.adjustIndent. Kept the constant in
+// TextFormatBar; no longer referenced here.
 const GUTTER_WIDTH = 28;
 
 const DEFAULT_TEXT: TextContent = {
@@ -56,6 +68,16 @@ export function TextEditOverlay() {
       />
     );
   }
+  if (target.kind === "table-cell") {
+    if (sourceShape.type !== "table") return null;
+    return (
+      <TextEditOverlayInner
+        key={`table:${sourceShape.id}:${target.row}:${target.col}`}
+        table={sourceShape as TableShape}
+        target={target}
+      />
+    );
+  }
   // sticky target
   if (sourceShape.type !== "sticky") return null;
   return (
@@ -91,10 +113,11 @@ type ResolvedTarget = {
 function TextEditOverlayInner(props: {
   shape?: ShapeShape;
   sticky?: StickyShape;
+  table?: TableShape;
   target: EditingTextTarget;
 }) {
-  const { shape, sticky, target } = props;
-  const owner = (shape ?? sticky)!;
+  const { shape, sticky, table, target } = props;
+  const owner = (shape ?? sticky ?? table)!;
   return <TextEditOverlayResolved owner={owner} target={target} />;
 }
 
@@ -109,18 +132,84 @@ function TextEditOverlayResolved({
     owner.type === "shape" ? (owner as ShapeShape) : null;
   const sticky =
     owner.type === "sticky" ? (owner as StickyShape) : null;
+  const table =
+    owner.type === "table" ? (owner as TableShape) : null;
   // Resolve the right TextContent subtree + bbox + writer.
   const resolved: ResolvedTarget | null = (() => {
-    if (target.kind === "shape" && shape) {
-      const text = shape.text ?? DEFAULT_TEXT;
+    if (target.kind === "table-cell" && table) {
+      const cell = table.cells[target.row]?.[target.col];
+      if (!cell) return null;
+      const bb = cellBBox(table, target.row, target.col);
+      const text = cell.text ?? DEFAULT_TEXT;
       return {
         text,
-        bbox: { x: shape.x, y: shape.y, width: shape.width, height: shape.height },
+        bbox: {
+          x: table.x + bb.x,
+          y: table.y + bb.y,
+          width: bb.width,
+          height: bb.height,
+        },
+        setText: (next) => {
+          const cur = useStore.getState().shapes.find((s) => s.id === table.id);
+          if (!cur || cur.type !== "table") return;
+          const t = cur as TableShape;
+          const existing = t.cells[target.row]?.[target.col] ?? {};
+          useStore.getState().updateShape(table.id, {
+            cells: replaceCell(t.cells, target.row, target.col, {
+              ...existing,
+              text: next,
+            }),
+          } as Partial<Shape>);
+        },
+        // Cells respect their fixed column/row size; text is clipped if it
+        // overflows. Auto-fit would require resizing the column, which is
+        // a v2 interaction.
+        autoFit: false,
+        rotation: table.rotation ?? 0,
+      };
+    }
+    if (target.kind === "shape" && shape) {
+      const text = shape.text ?? DEFAULT_TEXT;
+      // For form controls (tickbox / radio / toggle / slider) the label
+      // sits in the label rect, not over the full bbox. Force-split the
+      // layout (hasLabel=true) so the textarea opens where the label WILL
+      // be once the user types — even if the field is currently empty.
+      // Same FORM_CONTROL_GLYPH_CAP we pass in Canvas so the editor
+      // bbox matches the rendered label area exactly.
+      const isTickboxLike =
+        shape.kind === "tickbox" ||
+        shape.kind === "radio" ||
+        shape.kind === "toggle";
+      const glyphSize = isTickboxLike ? FORM_CONTROL_GLYPH_CAP : undefined;
+      const { labelRect } = computeFormControlLayout(
+        shape.kind,
+        shape.width,
+        shape.height,
+        true,
+        glyphSize,
+      );
+      const isFormControl = labelRect !== null;
+      const bbox = isFormControl
+        ? {
+            x: shape.x + labelRect!.x,
+            y: shape.y + labelRect!.y,
+            width: labelRect!.w,
+            height: labelRect!.h,
+          }
+        : { x: shape.x, y: shape.y, width: shape.width, height: shape.height };
+      // For form controls we DO want autoFit so the label area grows
+      // vertically as the user types multi-line text — but only the
+      // height should grow. Width is owned by the user (drag-resize the
+      // bbox). The autoFit useEffect below detects this case via
+      // `kind === form-control` and skips width updates.
+      return {
+        text,
+        bbox,
         setText: (next) =>
           useStore
             .getState()
             .updateShape(shape.id, { text: next } as Partial<Shape>),
-        autoFit: text.autoFit !== false,
+        autoFit: isFormControl ? true : text.autoFit !== false,
         rotation: shape.rotation ?? 0,
       };
     }
@@ -177,6 +266,7 @@ function TextEditOverlayResolved({
 function TextEditOverlayCore({
   owner,
   resolved,
+  target,
 }: {
   owner: Shape;
   resolved: ResolvedTarget;
@@ -193,11 +283,23 @@ function TextEditOverlayCore({
   const showRulerH = useStore((s) => s.showRulerH);
   const showRulerV = useStore((s) => s.showRulerV);
 
+  // Legacy textarea ref — kept around for the table-cell branch which still
+  // uses a plain textarea in v1. Shape and sticky branches use the Tiptap
+  // editor and don't touch this ref.
   const taRef = useRef<HTMLTextAreaElement>(null);
-  // Local mirror of the textarea value so each keystroke doesn't push to the
-  // store synchronously; we commit via resolved.setText on every keystroke
-  // under a history coalesce key so the entire session is one undo step.
-  const [value, setValue] = useState(() => resolved.text.text);
+  // Wrapper ref for the Tiptap editor's container. Used by the autoFit
+  // ResizeObserver to recompute width/height as the user types — the editor
+  // owns its own DOM state, so we observe the rendered size rather than
+  // re-running effects on every keystroke.
+  const editorWrapRef = useRef<HTMLDivElement>(null);
+  // Bumped by RichTextEditor's onLayoutTick whenever the editor updates so
+  // the autoFit effect re-runs even though it can't depend on Tiptap's
+  // internal state.
+  const [layoutTick, setLayoutTick] = useState(0);
+  const tickLayout = useMemo(
+    () => () => setLayoutTick((n) => n + 1),
+    [],
+  );
 
   useEffect(() => {
     useStore.getState().beginHistoryCoalesce(`text-edit-${shape.id}`);
@@ -207,6 +309,8 @@ function TextEditOverlayCore({
   }, [shape.id]);
 
   useLayoutEffect(() => {
+    // Table-cell branch only — Tiptap's editor focuses itself via the
+    // `autofocus: "end"` option in RichTextEditor.
     if (taRef.current) {
       taRef.current.focus();
       taRef.current.select();
@@ -217,41 +321,133 @@ function TextEditOverlayCore({
   const bbox = resolved.bbox;
   const autoFit = resolved.autoFit;
 
+  // Build the Tiptap doc once per edit session. Shape/sticky branches mount
+  // RichTextEditor with this doc; the editor instance is created once and
+  // commits flow back via `commitDoc` below.
+  //
+  // Sticky BODY branch uses `ensureStickyBodyDoc` so legacy stickies (no
+  // doc, plain `text` only) migrate with line 0 marked 24px bold — preserves
+  // the long-standing "first line is the title" visual cue without forcing
+  // users to manually re-bold + re-size existing titles. Shape and sticky-
+  // header branches use the plain `ensureDoc` (no title shim).
+  //
+  // Memoise on shape.id + target identity so re-renders during edit don't
+  // re-seed the editor. (The outer `<TextEditOverlayInner>` is already keyed
+  // on shape.id+field, so a different target produces a different React
+  // subtree anyway.)
+  const isStickyBody =
+    target.kind === "sticky" && target.field === "body";
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const initialDoc = useMemo<TipTapDoc>(
+    () => (isStickyBody ? ensureStickyBodyDoc(text) : ensureDoc(text)),
+    [shape.id],
+  );
+
+  // commitDoc — Tiptap's onUpdate handler. Funnel through `applyDoc` so the
+  // flat-field snapshot + plain-text mirror stay in sync with the new doc.
+  // Reads `resolved.text` from the closure lazily (via getState) so the
+  // committed doc is always merged onto the LATEST TextContent rather than
+  // the one captured at mount.
+  function commitDoc(doc: TipTapDoc) {
+    const cur = resolved.text;
+    resolved.setText(applyDoc(cur, doc));
+  }
+
   // Auto-fit both width and height to text content (ShapeShape only).
   // For sticky targets, autoFit is false — the sticky frame is fixed.
-  useLayoutEffect(() => {
+  //
+  // We use a ResizeObserver pattern instead of a render-time useLayoutEffect
+  // for two reasons:
+  //   1. The effect's dependency on `shape` (whole object) means every
+  //      updateShape mutation re-triggers the effect, producing an infinite
+  //      loop when measurement is even slightly unstable.
+  //   2. ResizeObserver fires only when the observed element's size actually
+  //      changes — the natural debounce we want for autofit.
+  //
+  // The observer watches the Tiptap editor's wrapper. We measure intrinsic
+  // content size by temporarily switching the wrapper to width:auto/height:
+  // auto, reading scrollWidth/scrollHeight, then restoring the layout
+  // styles. Because the wrapper's parent (the bbox div) has `width: bbox.
+  // width` from `shape.width`, leaving width:100% would constrain content
+  // and prevent shrink-to-fit from ever firing.
+  useEffect(() => {
     if (!autoFit) return;
-    const ta = taRef.current;
-    if (!ta) return;
     if (shape.type !== "shape") return;
-    ta.style.height = "auto";
-    ta.style.width = "auto";
-    const minHeight = Math.max(40, Math.round(text.fontSize * 1.6));
-    const minWidth = Math.max(40, Math.round(text.fontSize * 1.6));
-    const desiredHeight = Math.max(ta.scrollHeight, minHeight);
-    const desiredWidth = Math.max(ta.scrollWidth, minWidth);
-    ta.style.height = "100%";
-    ta.style.width = "100%";
-    if (
-      desiredHeight !== (shape as ShapeShape).height ||
-      desiredWidth !== (shape as ShapeShape).width
-    ) {
-      updateShape(shape.id, {
-        width: desiredWidth,
-        height: desiredHeight,
-      } as Partial<Shape>);
+    const wrap = editorWrapRef.current;
+    if (!wrap) return;
+    const probe =
+      wrap.querySelector<HTMLElement>("[data-text-editable-root]") ?? wrap;
+
+    // Re-measure on a microtask so we run AFTER any pending React commit.
+    // This avoids reading stale layout when called from onLayoutTick during
+    // a Tiptap transaction's commit phase.
+    let scheduled = false;
+    function measure() {
+      if (scheduled) return;
+      scheduled = true;
+      queueMicrotask(() => {
+        scheduled = false;
+        const cur = useStore
+          .getState()
+          .shapes.find((s) => s.id === shape.id) as ShapeShape | undefined;
+        if (!cur || cur.type !== "shape") return;
+        // Form controls (tickbox / radio / toggle / slider) own their own
+        // width — the user drag-resizes the bbox. AutoFit for them grows
+        // only the height so multi-line label text expands the box
+        // downward without changing the user's chosen width or making
+        // the glyph rect stretch sideways.
+        const isFormControl =
+          cur.kind === "tickbox" ||
+          cur.kind === "radio" ||
+          cur.kind === "toggle" ||
+          cur.kind === "slider";
+        const prevW = probe.style.width;
+        const prevH = probe.style.height;
+        if (!isFormControl) probe.style.width = "auto";
+        probe.style.height = "auto";
+        const minHeight = Math.max(40, Math.round(text.fontSize * 1.6));
+        const minWidth = Math.max(40, Math.round(text.fontSize * 1.6));
+        const desiredHeight = Math.max(probe.scrollHeight, minHeight);
+        const desiredWidth = isFormControl
+          ? cur.width
+          : Math.max(probe.scrollWidth, minWidth);
+        probe.style.width = prevW;
+        probe.style.height = prevH;
+        if (
+          desiredHeight !== cur.height ||
+          desiredWidth !== cur.width
+        ) {
+          updateShape(shape.id, {
+            width: desiredWidth,
+            height: desiredHeight,
+          } as Partial<Shape>);
+        }
+      });
     }
+
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(probe);
+    return () => ro.disconnect();
+    // shape.id is stable for the duration of this overlay (TextEditOverlay
+    // remounts on shape.id change via React `key`). Layout-affecting flat
+    // fields are listed so a font-size change forces a re-measure even when
+    // the rendered DOM size happens to be identical for some other reason.
+    // We DELIBERATELY exclude `shape` (object identity) and `updateShape`
+    // (stable function) — both would otherwise re-trigger this effect on
+    // every store transaction, producing the very loop this fix removes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     autoFit,
-    value,
+    shape.id,
+    shape.type,
+    layoutTick,
     text.fontSize,
     text.font,
     text.bold,
     text.italic,
     text.bullets,
     text.indent,
-    shape,
-    updateShape,
   ]);
   const leftOffset = showRulerV ? RULER_SIZE : 0;
   const topOffset = showRulerH ? RULER_SIZE : 0;
@@ -275,11 +471,6 @@ function TextEditOverlayCore({
   parts.push(`rotate(${resolved.rotation}deg)`);
   const transform = parts.join(" ");
 
-  function commitValue(v: string) {
-    setValue(v);
-    resolved.setText({ ...text, text: v });
-  }
-
   // Exit edit mode when the user clicks outside both the textarea and the
   // floating format bar. We can't use textarea.onBlur for this, because the
   // bar contains real inputs (font size, swatch popovers) that legitimately
@@ -295,9 +486,11 @@ function TextEditOverlayCore({
       const t = e.target as HTMLElement | null;
       if (!t) return;
       if (taRef.current && taRef.current.contains(t)) return;
-      // Sticky-body editor uses a contenteditable instead of a textarea —
-      // honour clicks inside it the same way (otherwise the very first click
-      // to position the caret would dismiss the overlay).
+      // Tiptap editor wrapper — the standard rich-text edit surface for
+      // shape and sticky branches. The legacy [data-sticky-body-editor]
+      // selector is kept for backward compat in case a stale subtree is
+      // still mounted (e.g. during an HMR transition).
+      if (t.closest("[data-text-editable-root]")) return;
       if (t.closest("[data-sticky-body-editor]")) return;
       if (t.closest('[data-text-format-bar]')) return;
       if (t.closest('[data-sticky-format-bar]')) return;
@@ -363,27 +556,44 @@ function TextEditOverlayCore({
         className="pointer-events-auto"
       >
         {owner.type === "sticky" ? (
-          // Sticky bodies use a contenteditable so the FIRST line styles
-          // at the title font (24px bold) live as the user types. Browsers
-          // create a new <div> per line on Enter; the editor re-applies
-          // styles to children by index so line 0 = title, lines 1+ = body.
-          // Matches the two-Text Konva render in Canvas exactly.
-          <StickyBodyEditor
-            key={`sb:${owner.id}`}
-            initialText={value}
-            fontFamily={text.font}
-            color={text.color}
-            bgColor={text.bgColor ?? "transparent"}
-            align={text.align}
-            titleFontSize={24}
-            restFontSize={text.fontSize ?? 12}
-            onChange={commitValue}
-          />
+          // Sticky bodies now use the same RichTextEditor (Tiptap) as text
+          // shapes. Per-character formatting (bold / italic / size / colour
+          // / etc.) works on the body just like in a text shape. The
+          // "first line is the title" cue is preserved by `ensureStickyBodyDoc`
+          // — when a legacy sticky (no doc) opens, line 0 gets bold + 24px
+          // marks so the visual continuity survives migration.
+          //
+          // Wrapper div with editorWrapRef so the autoFit ResizeObserver
+          // can probe size — same pattern as the text-shape branch — even
+          // though stickies have autoFit=false (the sticky frame is fixed,
+          // so the observer is harmless extra work; ref is also used by
+          // outside-click matching via [data-text-editable-root]).
+          <div
+            ref={editorWrapRef}
+            style={{ position: "relative", width: "100%", height: "100%" }}
+          >
+            <RichTextEditor
+              initialDoc={initialDoc}
+              defaults={text}
+              onDoc={commitDoc}
+              onLayoutTick={tickLayout}
+              paddingLeft={6}
+              paddingTop={6}
+              paddingRight={6}
+              paddingBottom={6}
+            />
+          </div>
         ) : (() => {
+          // Manual bullet gutter: keeps the visible bullet glyphs identical
+          // to the Konva render even though Tiptap also renders <ul>/<ol>
+          // inside its contentEditable. The gutter is computed from the
+          // PLAIN TEXT (`text.text`) which `applyDoc` keeps in sync with
+          // `text.doc` on every update — so as the user types in the editor,
+          // the gutter stays correct without us reaching into editor JSON.
           const baseIndent = 6 + (text.indent ?? 0) * 16;
           const showGutter = text.bullets !== "none";
           const lineHeightPx = text.fontSize * 1.2;
-          const lines = value.split("\n");
+          const lines = (text.text ?? "").split("\n");
           let counter = 0;
           const gutterItems = lines.map((line, i) => {
             const hasContent = line.length > 0;
@@ -407,54 +617,23 @@ function TextEditOverlayCore({
             );
           });
           return (
-            <>
-              <textarea
-                ref={taRef}
-                wrap={autoFit ? "off" : "soft"}
-                value={value}
-                onChange={(e) => commitValue(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Tab") {
-                    e.preventDefault();
-                    const d = e.shiftKey ? -1 : 1;
-                    const next = Math.max(
-                      0,
-                      Math.min(MAX_INDENT, (text.indent ?? 0) + d)
-                    );
-                    resolved.setText({ ...text, indent: next });
-                    e.stopPropagation();
-                    return;
-                  }
-                  // Stop bubbling so global shortcuts (e.g. Delete) don't fire.
-                  e.stopPropagation();
-                }}
-                style={{
-                  width: "100%",
-                  // Auto-fit mode: fill the box (which is sized to content
-                  // anyway). Manual-resize mode: collapse to content height
-                  // so the wrapping flex container can vertically align it
-                  // top/middle/bottom inside the user's larger box.
-                  height: autoFit ? "100%" : "auto",
-                  maxHeight: "100%",
-                  paddingTop: 6,
-                  paddingRight: 6,
-                  paddingBottom: 6,
-                  paddingLeft: showGutter ? baseIndent + GUTTER_WIDTH : baseIndent,
-                  margin: 0,
-                  border: "none",
-                  outline: "none",
-                  background: text.bgColor ?? "transparent",
-                  resize: "none",
-                  overflow: "hidden",
-                  fontFamily: text.font,
-                  fontSize: text.fontSize,
-                  color: text.color,
-                  fontWeight: text.bold ? "bold" : "normal",
-                  fontStyle: text.italic ? "italic" : "normal",
-                  textDecoration: text.underline ? "underline" : "none",
-                  textAlign: text.align,
-                  lineHeight: 1.2,
-                }}
+            // Relative wrapper so the absolute-positioned bullet gutter anchors
+            // here (not the outer bbox box, which has its own padding/border
+            // model). Also serves as the ref target for the autoFit effect's
+            // ResizeObserver-based content-size probe.
+            <div
+              ref={editorWrapRef}
+              style={{ position: "relative", width: "100%", height: "100%" }}
+            >
+              <RichTextEditor
+                initialDoc={initialDoc}
+                defaults={text}
+                onDoc={commitDoc}
+                onLayoutTick={tickLayout}
+                paddingLeft={showGutter ? baseIndent + GUTTER_WIDTH : baseIndent}
+                paddingTop={6}
+                paddingRight={6}
+                paddingBottom={6}
               />
               {showGutter && (
                 <div
@@ -478,7 +657,7 @@ function TextEditOverlayCore({
                   {gutterItems}
                 </div>
               )}
-            </>
+            </div>
           );
         })()}
       </div>
@@ -486,143 +665,8 @@ function TextEditOverlayCore({
   );
 }
 
-/**
- * Contenteditable editor used exclusively for sticky body text. Splits the
- * value on `\n` into one `<div>` per line and styles by INDEX:
- *   • line 0  → 24px bold (the "title" cue)
- *   • lines 1+ → restFontSize (default 12)
- *
- * This mirrors the two-Text Konva render in Canvas.tsx so the user sees the
- * same visual treatment whether the sticky is being edited or just sitting
- * on the canvas. The data model stays a single string — Enter inserts a
- * `\n` (browser creates a new <div>), and onInput we serialize back via
- * `Array.from(children).map(c => c.textContent).join("\n")`.
- *
- * We do NOT re-render the children from React (controlled-input pattern
- * fights contenteditable cursor positioning). Instead, the initial DOM is
- * set once via `innerHTML` on mount, and on every input we just re-apply
- * the per-index inline style — that touches the style attribute, not the
- * children, so the cursor stays put.
- */
-function StickyBodyEditor({
-  initialText,
-  fontFamily,
-  color,
-  bgColor,
-  align,
-  titleFontSize,
-  restFontSize,
-  onChange,
-}: {
-  initialText: string;
-  fontFamily: string;
-  color: string;
-  bgColor: string;
-  align: TextContent["align"];
-  titleFontSize: number;
-  restFontSize: number;
-  onChange: (next: string) => void;
-}) {
-  const ref = useRef<HTMLDivElement>(null);
-
-  const applyChildStyles = (root: HTMLDivElement) => {
-    const kids = Array.from(root.children) as HTMLElement[];
-    kids.forEach((el, i) => {
-      const fs = i === 0 ? titleFontSize : restFontSize;
-      el.style.fontSize = `${fs}px`;
-      el.style.fontWeight = i === 0 ? "700" : "400";
-      el.style.lineHeight = "1.2";
-      // Empty lines collapse to height 0 — keep them visible by giving them
-      // an explicit min-height that matches their font.
-      el.style.minHeight = `${Math.ceil(fs * 1.2)}px`;
-    });
-  };
-
-  // Mount: seed the contenteditable with one <div> per line. Browsers vary
-  // a bit on the default block element used when the user presses Enter
-  // (Chrome: <div>, Firefox legacy: <br>); we force `<div>` via the
-  // long-deprecated-but-still-honored `defaultParagraphSeparator` command.
-  useLayoutEffect(() => {
-    const el = ref.current;
-    if (!el) return;
-    try {
-      // execCommand is deprecated but still works in all current browsers
-      // for this specific knob; there's no spec-compliant replacement yet.
-      document.execCommand("defaultParagraphSeparator", false, "div");
-    } catch {
-      // ignore — fall back to whatever the browser uses
-    }
-    const lines = initialText === "" ? [""] : initialText.split("\n");
-    el.innerHTML = lines
-      .map((line) => {
-        const safe = line === "" ? "<br>" : escapeHtml(line);
-        return `<div>${safe}</div>`;
-      })
-      .join("");
-    applyChildStyles(el);
-    // Place caret at the end of the last line.
-    el.focus();
-    const range = document.createRange();
-    range.selectNodeContents(el);
-    range.collapse(false);
-    const sel = window.getSelection();
-    sel?.removeAllRanges();
-    sel?.addRange(range);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  function readPlainText(root: HTMLDivElement): string {
-    // Browsers represent empty lines as `<div><br></div>` — `.textContent`
-    // returns "" for that, which is what we want when serialising to a
-    // newline-separated string.
-    const kids = Array.from(root.children) as HTMLElement[];
-    if (kids.length === 0) return root.textContent ?? "";
-    return kids.map((el) => el.textContent ?? "").join("\n");
-  }
-
-  const handleInput = () => {
-    const el = ref.current;
-    if (!el) return;
-    applyChildStyles(el);
-    onChange(readPlainText(el));
-  };
-
-  return (
-    <div
-      ref={ref}
-      data-sticky-body-editor
-      contentEditable
-      suppressContentEditableWarning
-      onInput={handleInput}
-      onKeyDown={(e) => {
-        // Stop bubbling so global shortcuts (Delete, Cmd+Z, …) don't fire
-        // on the canvas while we're typing inside the sticky.
-        e.stopPropagation();
-      }}
-      style={{
-        width: "100%",
-        height: "100%",
-        padding: 6,
-        margin: 0,
-        border: "none",
-        outline: "none",
-        background: bgColor,
-        overflow: "auto",
-        fontFamily,
-        color,
-        textAlign: align,
-        whiteSpace: "pre-wrap",
-        wordBreak: "break-word",
-      }}
-    />
-  );
-}
-
-// Minimal HTML escaper for the contenteditable seed. Body text is plain
-// strings, but a stray `<` would otherwise become a tag — keep that safe.
-function escapeHtml(s: string): string {
-  return s
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}
+// `StickyBodyEditor` and its `escapeHtml` helper used to live here. Sticky
+// bodies now use the same RichTextEditor (Tiptap) wrapper as text shapes —
+// per-character bold/italic/size/colour replaces the hand-rolled per-index
+// styling. Migration of legacy stickies preserves the title-line cue via
+// `ensureStickyBodyDoc` (src/lib/tiptapDoc.ts).
