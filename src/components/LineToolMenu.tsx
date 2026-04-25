@@ -27,6 +27,7 @@ import { RoutingDropdown } from "./lineTool/RoutingDropdown";
 import { PatternDropdown } from "./lineTool/PatternDropdown";
 import { MarkerDropdown } from "./lineTool/MarkerDropdown";
 import { ColorDropdown } from "./lineTool/ColorDropdown";
+import { LineColorSwatches } from "./lineTool/LineColors";
 import { RULER_SIZE } from "./Rulers";
 import {
   ArrowLeftRight,
@@ -245,13 +246,26 @@ export function LineToolMenu() {
       <Separator />
 
       {/* ─── Color (dropdown — swatches + opacity live inside the popover,
-          mirroring the Pen / Shape tool pattern in SheetToolbar.tsx) ─── */}
+          mirroring the Pen / Shape tool pattern in SheetToolbar.tsx).
+          Passing `presets` flips the dropdown into buffered Cancel/Apply
+          mode (see ColorDropdown.tsx) AND hides the generic LIGHT_BAND +
+          DARK_BAND default rows on the inner picker — replacing them with
+          the curated 9-swatch line palette from `lineTool/LineColors.tsx`.
+          The Custom HSV/sliders/RGB/HSL/HEX block below the palette is
+          retained, and Cancel/Apply enable only when a draft change is
+          pending. */}
       <Section label="Color">
         <ColorDropdown
           color={color}
           opacity={opacity}
           onColorChange={setColor}
           onOpacityChange={setOpacity}
+          presets={{
+            label: "Line colours",
+            render: ({ value, onChange }) => (
+              <LineColorSwatches value={value} onChange={onChange} />
+            ),
+          }}
         />
       </Section>
 

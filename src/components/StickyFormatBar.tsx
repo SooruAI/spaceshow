@@ -15,8 +15,8 @@ import {
   Unlock,
 } from "lucide-react";
 import { useStore } from "../store";
-import { STICKY_COLOR_SWATCHES, DEFAULT_STICKY_BG } from "../lib/sticky";
-import { ColorPickerPanel } from "./ColorPickerPanel";
+import { DEFAULT_STICKY_BG } from "../lib/sticky";
+import { StickyColorPicker } from "./StickyColorPicker";
 import { RULER_SIZE } from "./Rulers";
 import type { StickyShape } from "../types";
 
@@ -115,17 +115,27 @@ export function StickyFormatBar() {
 
   // Color value source switches between the two modes:
   //  • In tool-pick mode, read/write `toolColors.sticky` — the next sticky's
-  //    bgColor seed.
-  //  • In selection mode, read/write the selected sticky's `bgColor`.
+  //    bgColor seed. Tool-mode stickies always seed at full opacity for now;
+  //    the picker still surfaces the alpha slider so the user can dial in a
+  //    transparent colour BEFORE dropping (commits to the selected sticky
+  //    only, not back to the tool-colour state).
+  //  • In selection mode, read/write the selected sticky's `bgColor` AND
+  //    `bgOpacity` together.
   const bg = sticky?.bgColor ?? toolColors.sticky ?? DEFAULT_STICKY_BG;
+  const bgAlpha = sticky?.bgOpacity ?? 1;
 
-  function pickColor(value: string) {
+  function applyColor(next: { color: string; opacity: number }) {
     if (sticky) {
-      updateShape(sticky.id, { bgColor: value } as Partial<StickyShape>);
+      updateShape(sticky.id, {
+        bgColor: next.color,
+        bgOpacity: next.opacity,
+      } as Partial<StickyShape>);
     } else {
-      // Tool-pick mode — persist on the tool so the next dropped sticky uses
-      // this colour without clobbering already-placed stickies.
-      setToolColor("sticky", value);
+      // Tool-pick mode — persist colour on the tool so the next dropped
+      // sticky uses it without clobbering already-placed stickies. Opacity
+      // is intentionally NOT persisted to the tool: the next sticky always
+      // drops opaque, and the user dials transparency per-shape after that.
+      setToolColor("sticky", next.color);
     }
   }
 
@@ -175,18 +185,20 @@ export function StickyFormatBar() {
           }`}
         >
           <Palette size={13} />
+          {/* Trigger swatch reflects BOTH colour and opacity — a half-
+              transparent tile reads as "this sticky has alpha applied" at a
+              glance, without having to open the picker. */}
           <span
             className="inline-block w-3.5 h-3.5 rounded-sm ring-1 ring-black/40"
-            style={{ background: bg }}
+            style={{ background: bg, opacity: bgAlpha }}
           />
         </button>
         {colorOpen && (
-          <StickyColorPopover
-            current={bg}
-            onPick={(c) => {
-              pickColor(c);
-              setColorOpen(false);
-            }}
+          <StickyColorPicker
+            value={bg}
+            opacity={bgAlpha}
+            onApply={applyColor}
+            onClose={() => setColorOpen(false)}
           />
         )}
       </div>
@@ -287,49 +299,6 @@ export function StickyFormatBar() {
           />
         )}
       </div>
-    </div>
-  );
-}
-
-/** Color swatch popover — 6 presets followed by a custom-hex picker. Anchored
- *  below the Color button (uses the parent `relative` wrapper for layout). */
-function StickyColorPopover({
-  current,
-  onPick,
-}: {
-  current: string;
-  onPick: (c: string) => void;
-}) {
-  return (
-    <div
-      className="absolute top-full mt-2 left-0 z-40 rounded-md shadow-2xl p-3 w-64 ring-1 ring-black/40"
-      style={{ background: "var(--bg-secondary)" }}
-    >
-      <div className="text-[10px] uppercase tracking-wider text-ink-400 mb-2">
-        Sticky colour
-      </div>
-      <div className="flex items-center gap-1.5 mb-3 flex-wrap">
-        {STICKY_COLOR_SWATCHES.map((s) => {
-          const active = current?.toLowerCase() === s.value.toLowerCase();
-          return (
-            <button
-              key={s.value}
-              type="button"
-              title={s.label}
-              onMouseDown={(e) => e.preventDefault()}
-              onClick={() => onPick(s.value)}
-              className={`w-6 h-6 rounded-md ring-1 transition-transform hover:scale-110 ${
-                active ? "ring-2 ring-brand-500" : "ring-ink-700"
-              }`}
-              style={{ background: s.value }}
-            />
-          );
-        })}
-      </div>
-      {/* Custom hex picker — `mode="live"` so every swatch/slider tick fires
-          onChange straight through to the store, matching the preset row's
-          single-click commit semantics. */}
-      <ColorPickerPanel value={current} onChange={onPick} mode="live" />
     </div>
   );
 }

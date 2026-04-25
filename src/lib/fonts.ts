@@ -148,11 +148,8 @@ export const TEXT_FONTS: TextFont[] = [
 
 export const DEFAULT_TEXT_FONT = TEXT_FONTS[0].value;
 
-export const TEXT_COLOR_SWATCHES: { label: string; value: string }[] = [
-  { label: "Black",  value: "#000000" },
-  { label: "Red",    value: "#ef4444" },
-  { label: "Green",  value: "#22c55e" },
-  { label: "Blue",   value: "#3b82f6" },
-  { label: "Orange", value: "#f97316" },
-  { label: "Purple", value: "#a855f7" },
-];
+// The Text colour and Text-background colour preset palettes now live with
+// their respective picker components (`TextColorPicker.tsx` /
+// `TextBackgroundColorPicker.tsx`) so the swatch list is co-located with
+// the UI that surfaces it. If you need to import a palette elsewhere,
+// import `TEXT_COLOR_PRESETS` or `TEXT_BG_COLOR_PRESETS` from those files.

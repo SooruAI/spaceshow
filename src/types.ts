@@ -271,6 +271,10 @@ export interface StickyShape extends BaseShape {
    *  hex via the custom-color tile. Optional for back-compat with legacy
    *  stickies — renderer falls back to the yellow default. */
   bgColor?: string;
+  /** 0..1 alpha for the background fill. Lets the user dial in semi-
+   *  transparent stickies via the picker's alpha slider. Optional + missing
+   *  is treated as fully opaque (1) so legacy stickies render unchanged. */
+  bgOpacity?: number;
   /** Author user-id at creation time. Read from store.currentUserId. */
   authorId?: string;
   /** Epoch ms at creation. Rendered as a relative/short date in the footer. */

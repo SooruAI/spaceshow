@@ -2,20 +2,28 @@ import type { TextContent, User } from "../types";
 import { DEFAULT_TEXT_FONT } from "./fonts";
 
 /**
- * Preset palette for the sticky color picker. Order is the visual order in
- * the swatch row. The first entry (yellow) is the create-time default — keep
- * it at index 0 so `STICKY_COLOR_SWATCHES[0].value` is the canonical fallback.
+ * Preset palette for the sticky color picker — soft pastel "Post-it"-style
+ * fills. Order in the array is the left-to-right visual order in the picker.
+ *
+ * Custom colours (any hex / opacity) are picked via the SV+hue+alpha sliders
+ * in `StickyColorPicker`, modelled on the pen-tool colour popover. The
+ * preset row stays intentionally short — these are the "one-click" defaults
+ * for users who don't want to mix a custom colour.
  */
 export const STICKY_COLOR_SWATCHES: { label: string; value: string }[] = [
-  { label: "Yellow", value: "#fef3c7" },
-  { label: "Blue",   value: "#dbeafe" },
-  { label: "Green",  value: "#d1fae5" },
-  { label: "Pink",   value: "#fce7f3" },
-  { label: "Orange", value: "#fed7aa" },
-  { label: "White",  value: "#ffffff" },
+  { label: "White",    value: "#ffffff" },
+  { label: "Yellow",   value: "#fef3c7" },
+  { label: "Pink",     value: "#fce7f3" },
+  { label: "Blue",     value: "#dbeafe" },
+  { label: "Peach",    value: "#fed7aa" },
+  { label: "Green",    value: "#d1fae5" },
+  { label: "Lavender", value: "#e9d5ff" },
 ];
 
-export const DEFAULT_STICKY_BG = STICKY_COLOR_SWATCHES[0].value;
+/** Canonical default sticky background — soft light yellow, the second tile
+ *  in the preset row. Hard-coded (not array-indexed) so reordering the
+ *  palette in the future can't silently change the default. */
+export const DEFAULT_STICKY_BG = "#fef3c7";
 
 /** Default styling for a freshly-created sticky's HEADER text field — bold,
  *  slightly larger than body, top-aligned. */

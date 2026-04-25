@@ -32,6 +32,13 @@ interface Props {
    * embedded inside another panel that owns its own commit flow.
    */
   mode?: "apply" | "live";
+  /**
+   * Hide the two preset bands at the top of the panel (LIGHT_BAND +
+   * DARK_BAND). Used by the Pen tool variants, which surface their own
+   * curated palettes via `ColorDropdown.presets` — the generic bands would
+   * compete visually with that variant-specific row.
+   */
+  hideBands?: boolean;
 }
 
 // ── Color helpers ───────────────────────────────────────────────────────────
@@ -224,7 +231,12 @@ function hslToRgb(
 
 // ── Panel ───────────────────────────────────────────────────────────────────
 
-export function ColorPickerPanel({ value, onChange, mode = "apply" }: Props) {
+export function ColorPickerPanel({
+  value,
+  onChange,
+  mode = "apply",
+  hideBands = false,
+}: Props) {
   const committed = normalize(value || "#FFFFFF");
 
   // `draft` is the live preview. In "apply" mode, `onChange` only fires from
@@ -343,8 +355,12 @@ export function ColorPickerPanel({ value, onChange, mode = "apply" }: Props) {
 
   return (
     <div className="space-y-2.5">
-      <Band swatches={LIGHT_BAND} value={draft} onPick={pickSwatch} />
-      <Band swatches={DARK_BAND} value={draft} onPick={pickSwatch} />
+      {!hideBands && (
+        <>
+          <Band swatches={LIGHT_BAND} value={draft} onPick={pickSwatch} />
+          <Band swatches={DARK_BAND} value={draft} onPick={pickSwatch} />
+        </>
+      )}
 
       {/* Full-spectrum "infinity colours" picker */}
       <div className="border-t border-ink-700 pt-2.5 space-y-2">

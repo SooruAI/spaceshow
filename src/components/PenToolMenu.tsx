@@ -38,6 +38,9 @@ import {
 import { useStore } from "../store";
 import type { PenShape, PenVariant } from "../types";
 import { ColorDropdown } from "./lineTool/ColorDropdown";
+import { PenColorSwatches } from "./pen/PenColors";
+import { MarkerColorSwatches } from "./pen/MarkerColors";
+import { HighlighterColorSwatches } from "./pen/HighlighterColors";
 import { RULER_SIZE } from "./Rulers";
 
 const PEN_VARIANTS: { id: PenVariant; label: string }[] = [
@@ -249,6 +252,36 @@ export function PenToolMenu() {
           opacity={opacity}
           onColorChange={setColor}
           onOpacityChange={setOpacity}
+          // Variant-specific curated palette appears above the full picker.
+          // Each variant owns its colours in src/components/pen/*Colors.tsx —
+          // see those files for the canonical defaults (Pen→Blue, Marker→
+          // Red, Highlighter→Neon Yellow). Store defaults in store.ts mirror
+          // each palette's first entry verbatim.
+          presets={
+            variant === "marker"
+              ? {
+                  label: "Marker colours",
+                  render: ({ value, onChange }) => (
+                    <MarkerColorSwatches value={value} onChange={onChange} />
+                  ),
+                }
+              : variant === "highlighter"
+              ? {
+                  label: "Highlighter colours",
+                  render: ({ value, onChange }) => (
+                    <HighlighterColorSwatches
+                      value={value}
+                      onChange={onChange}
+                    />
+                  ),
+                }
+              : {
+                  label: "Pen colours",
+                  render: ({ value, onChange }) => (
+                    <PenColorSwatches value={value} onChange={onChange} />
+                  ),
+                }
+          }
         />
       </Section>
 

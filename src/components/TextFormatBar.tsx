@@ -30,10 +30,11 @@ import type {
   StickyShape,
   TextContent,
 } from "../types";
-import { ColorPickerPanel } from "./ColorPickerPanel";
 import { FontPicker } from "./FontPicker";
 import { TextTypePicker } from "./TextTypePicker";
-import { DEFAULT_TEXT_FONT, TEXT_COLOR_SWATCHES } from "../lib/fonts";
+import { TextColorPicker } from "./TextColorPicker";
+import { TextBackgroundColorPicker } from "./TextBackgroundColorPicker";
+import { DEFAULT_TEXT_FONT } from "../lib/fonts";
 import { BULLET_OPTIONS, NUMBER_OPTIONS } from "../lib/listFormat";
 import { inferTextType, type TextTypePreset } from "../lib/textTypes";
 import { RULER_SIZE } from "./Rulers";
@@ -289,20 +290,11 @@ export function TextFormatBar() {
           />
         </button>
         {colorOpen && (
-          <SwatchPopover
-            label="Text colour"
-            current={text.color}
-            onPick={(c) => {
-              if (c == null) return;
-              patch({ color: c });
-              setColorOpen(false);
-            }}
-          >
-            <ColorPickerPanel
-              value={text.color}
-              onChange={(c) => patch({ color: c })}
-            />
-          </SwatchPopover>
+          <TextColorPicker
+            value={text.color}
+            onChange={(c) => patch({ color: c })}
+            onClose={() => setColorOpen(false)}
+          />
         )}
       </div>
 
@@ -333,20 +325,11 @@ export function TextFormatBar() {
           />
         </button>
         {bgOpen && (
-          <SwatchPopover
-            label="Background colour"
-            current={text.bgColor ?? null}
-            allowNone
-            onPick={(c) => {
-              patch({ bgColor: c ?? undefined });
-              setBgOpen(false);
-            }}
-          >
-            <ColorPickerPanel
-              value={text.bgColor ?? "#ffffff"}
-              onChange={(c) => patch({ bgColor: c })}
-            />
-          </SwatchPopover>
+          <TextBackgroundColorPicker
+            value={text.bgColor ?? null}
+            onChange={(c) => patch({ bgColor: c ?? undefined })}
+            onClose={() => setBgOpen(false)}
+          />
         )}
       </div>
 
@@ -532,71 +515,6 @@ export function TextFormatBar() {
       >
         <IndentIncrease size={13} />
       </ToggleBtn>
-    </div>
-  );
-}
-
-function SwatchPopover({
-  label,
-  current,
-  allowNone,
-  onPick,
-  children,
-}: {
-  label: string;
-  current: string | null;
-  allowNone?: boolean;
-  onPick: (c: string | null) => void;
-  children: React.ReactNode;
-}) {
-  return (
-    <div
-      // `left-0` anchors the popover under the triggering color button (each
-      // button is wrapped in a `relative` container in the parent bar). The
-      // previous `right-0` made sense when the colour buttons lived at the
-      // very end of the toolbar; after the move next to Font Size, `left-0`
-      // keeps the popover on-screen by extending rightward into the bar's
-      // remaining width rather than spilling off the left edge.
-      className="absolute top-full mt-2 left-0 z-40 panel rounded-md shadow-2xl p-3 w-64"
-      style={{ background: "var(--bg-secondary)" }}
-    >
-      <div className="text-[10px] uppercase tracking-wider text-ink-400 mb-2">
-        {label}
-      </div>
-      <div className="flex items-center gap-1.5 mb-3 flex-wrap">
-        {TEXT_COLOR_SWATCHES.map((s) => {
-          const active = current?.toLowerCase() === s.value.toLowerCase();
-          return (
-            <button
-              key={s.value}
-              title={s.label}
-              onMouseDown={(e) => e.preventDefault()}
-              onClick={() => onPick(s.value)}
-              className={`w-6 h-6 rounded-md ring-1 transition-transform hover:scale-110 ${
-                active ? "ring-2 ring-brand-500" : "ring-ink-700"
-              }`}
-              style={{ background: s.value }}
-            />
-          );
-        })}
-        {allowNone && (
-          <button
-            title="No colour"
-            onMouseDown={(e) => e.preventDefault()}
-            onClick={() => onPick(null)}
-            className={`w-6 h-6 rounded-md ring-1 transition-transform hover:scale-110 relative overflow-hidden ${
-              current == null ? "ring-2 ring-brand-500" : "ring-ink-700"
-            }`}
-            style={{
-              backgroundImage:
-                "linear-gradient(45deg, #888 25%, transparent 25%, transparent 75%, #888 75%), linear-gradient(45deg, #888 25%, transparent 25%, transparent 75%, #888 75%)",
-              backgroundSize: "8px 8px",
-              backgroundPosition: "0 0, 4px 4px",
-            }}
-          />
-        )}
-      </div>
-      {children}
     </div>
   );
 }

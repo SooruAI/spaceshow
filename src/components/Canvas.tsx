@@ -3683,6 +3683,12 @@ function ShapeNode({
     // Legacy stickies that only carry `shape.text` fall back to it as the
     // body content so old saves keep displaying.
     const bg = shape.bgColor ?? DEFAULT_STICKY_BG;
+    // bgOpacity is optional + defaults to 1. The picker can dial this between
+    // 0 (fully transparent) and 1 (fully opaque). We apply it to the fill
+    // Rect ONLY (the shadow + child Text nodes stay fully opaque so the body
+    // text doesn't fade with the background — readability beats aesthetic
+    // consistency here).
+    const bgAlpha = Math.max(0, Math.min(1, shape.bgOpacity ?? 1));
     const padX = 12;
     const padY = 10;
     const footerH = 14;
@@ -3756,6 +3762,7 @@ function ShapeNode({
           width={shape.width}
           height={shape.height}
           fill={bg}
+          opacity={bgAlpha}
           stroke={selected ? (stroke ?? "#0d9488") : "rgba(0,0,0,0.08)"}
           strokeWidth={selected ? 2 : 1}
           cornerRadius={6}
