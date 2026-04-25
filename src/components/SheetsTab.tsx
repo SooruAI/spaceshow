@@ -63,6 +63,7 @@ export function SheetsTab() {
   const moveSheetToTop = useStore((s) => s.moveSheetToTop);
   const moveSheetToBottom = useStore((s) => s.moveSheetToBottom);
   const zoomToSheet = useStore((s) => s.zoomToSheet);
+  const viewportSize = useStore((s) => s.viewportSize);
   const viewMode = useStore((s) => s.sheetsViewMode);
 
   const [filter, setFilter] = useState<Filter>("all");
@@ -129,11 +130,11 @@ export function SheetsTab() {
                 onSelect={() => {
                   setActiveSheet(sheet.id);
                   selectSheet(sheet.id);
-                  zoomToSheet(
-                    sheet.id,
-                    window.innerWidth,
-                    window.innerHeight,
-                  );
+                  // Fit against the real canvas viewport (kept in sync by
+                  // App.tsx's ResizeObserver). Using `window.innerWidth`
+                  // here would overcount by the width of the sidebars,
+                  // leaving the sheet scaled too large and off-center.
+                  zoomToSheet(sheet.id, viewportSize.w, viewportSize.h);
                 }}
                 onToggleHidden={() => toggleSheetHidden(sheet.id)}
                 onMove={(dir) => {

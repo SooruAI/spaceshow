@@ -3,6 +3,7 @@ import {
   AlignCenter,
   AlignCenterHorizontal,
   AlignEndHorizontal,
+  AlignJustify,
   AlignLeft,
   AlignRight,
   AlignStartHorizontal,
@@ -21,10 +22,12 @@ import {
 import { useStore } from "../store";
 import type {
   BulletStyle,
+  EditingTextTarget,
   ListStyle,
   NumberStyle,
   Shape,
   ShapeShape,
+  StickyShape,
   TextContent,
 } from "../types";
 import { ColorPickerPanel } from "./ColorPickerPanel";
@@ -52,12 +55,13 @@ const MAX_INDENT = 6;
 
 /**
  * Floating toolbar above the text-edit overlay. Visible while editing a text
- * shape (`editingTextShapeId` set) OR while the text tool is active —
- * in the latter case the bar edits per-tool defaults that are applied to the
- * next text shape created.
+ * field (`editingText` set) — supports both ShapeShape `text` and
+ * StickyShape `header`/`body`. Also visible while the text tool is active —
+ * in that case the bar edits per-tool defaults applied to the next text
+ * shape created.
  */
 export function TextFormatBar() {
-  const editingId = useStore((s) => s.editingTextShapeId);
+  const target = useStore((s) => s.editingText);
   const tool = useStore((s) => s.tool);
   const updateShape = useStore((s) => s.updateShape);
   const setToolFont = useStore((s) => s.setToolFont);
@@ -68,11 +72,28 @@ export function TextFormatBar() {
   const toolFontSize = useStore((s) => s.toolFontSize);
   const toolTextColor = useStore((s) => s.toolColors.text);
   const toolTextDefaults = useStore((s) => s.toolTextDefaults);
-  const shape = useStore((s) => {
-    if (!s.editingTextShapeId) return null;
-    const sh = s.shapes.find((x) => x.id === s.editingTextShapeId);
-    return sh && sh.type === "shape" ? (sh as ShapeShape) : null;
+  // Resolve the active TextContent subtree from the current target. For
+  // shape targets that's `shape.text`; for sticky targets it's the
+  // `header` or `body` field. `editingShape` is the owning Shape so the
+  // patch path knows which field to update.
+  const editingShape = useStore((s) => {
+    if (!s.editingText) return null;
+    return s.shapes.find((x) => x.id === s.editingText!.id) ?? null;
   });
+  const editingTarget: EditingTextTarget | null = target;
+  const editingText: TextContent | null = (() => {
+    if (!editingTarget || !editingShape) return null;
+    if (editingTarget.kind === "shape") {
+      return editingShape.type === "shape"
+        ? ((editingShape as ShapeShape).text ?? null)
+        : null;
+    }
+    if (editingShape.type !== "sticky") return null;
+    const sticky = editingShape as StickyShape;
+    return editingTarget.field === "header"
+      ? sticky.header ?? null
+      : sticky.body ?? null;
+  })();
   const [colorOpen, setColorOpen] = useState(false);
   const [bgOpen, setBgOpen] = useState(false);
   const [bulletStyleOpen, setBulletStyleOpen] = useState(false);
@@ -94,12 +115,12 @@ export function TextFormatBar() {
     return () => document.removeEventListener("mousedown", onMd);
   }, [colorOpen, bgOpen, bulletStyleOpen, numberStyleOpen]);
 
-  const isEditing = !!shape && !!editingId;
+  const isEditing = !!editingTarget && !!editingShape && !!editingText;
   const showBar = isEditing || tool === "text";
   if (!showBar) return null;
 
   const text: TextContent = isEditing
-    ? (shape!.text ?? DEFAULT_TEXT)
+    ? (editingText ?? DEFAULT_TEXT)
     : {
         text: "",
         font: toolFont,
@@ -118,8 +139,16 @@ export function TextFormatBar() {
       };
 
   function patch(p: Partial<TextContent>) {
-    if (isEditing) {
-      updateShape(shape!.id, { text: { ...text, ...p } } as Partial<Shape>);
+    if (isEditing && editingTarget && editingShape) {
+      const next = { ...text, ...p };
+      // Route the write to the right field based on the active target.
+      const fieldPatch: Partial<Shape> =
+        editingTarget.kind === "shape"
+          ? ({ text: next } as Partial<Shape>)
+          : editingTarget.field === "header"
+          ? ({ header: next } as Partial<Shape>)
+          : ({ body: next } as Partial<Shape>);
+      updateShape(editingShape.id, fieldPatch);
       return;
     }
     if (p.font !== undefined) setToolFont(p.font);
@@ -145,13 +174,24 @@ export function TextFormatBar() {
   }
   const currentType = inferTextType(text.fontSize, text.bold);
 
+  // When editing a sticky field, the StickyFormatBar is also mounted at the
+  // top-center anchor. Push this bar down by one bar-height (~38px) + gap so
+  // the two stack cleanly: StickyFormatBar on top, TextFormatBar directly
+  // below it. For all other targets (regular text shape, or text-tool
+  // defaults) the bar stays at its normal top-center position.
+  const STICKY_BAR_OFFSET = 46; // ~38px bar + 8px gap, hand-tuned to match
+  const topPx =
+    editingTarget?.kind === "sticky"
+      ? RULER_SIZE + 8 + STICKY_BAR_OFFSET
+      : RULER_SIZE + 8;
+
   return (
     <div
       ref={rootRef}
       data-text-format-bar
       className="absolute left-1/2 -translate-x-1/2 z-40 flex items-center gap-0.5 px-1.5 py-1 rounded-full shadow-xl ring-1 ring-black/40"
       style={{
-        top: RULER_SIZE + 8,
+        top: topPx,
         background: "var(--bg-secondary)",
         backdropFilter: "blur(6px)",
       }}
@@ -168,7 +208,22 @@ export function TextFormatBar() {
         }}
       />
 
+      {/* Font size — chevron-flanked spinner:
+       *   [▼ decrease] [ 16 ] [▲ increase]
+       * The two buttons flank the number instead of stacking on one side so
+       * each arrow targets a single direction (down = smaller, up = larger),
+       * matching the user's mental model of a vertical axis. */}
       <div className="flex items-stretch h-7 rounded-full bg-ink-700/80 border border-ink-700 overflow-hidden hover:bg-ink-700 transition-colors">
+        <button
+          type="button"
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={() => adjustFontSize(-1)}
+          title="Decrease font size"
+          aria-label="Decrease font size"
+          className="px-1.5 grid place-items-center text-ink-300 hover:text-ink-100 hover:bg-ink-600/60"
+        >
+          <ChevronDown size={12} strokeWidth={3} />
+        </button>
         <input
           type="number"
           min={8}
@@ -192,29 +247,107 @@ export function TextFormatBar() {
             }
             e.stopPropagation();
           }}
-          className="w-9 px-1.5 text-xs text-center bg-transparent text-ink-100 outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:m-0 [&::-webkit-outer-spin-button]:m-0"
+          className="w-9 px-1 text-xs text-center bg-transparent text-ink-100 outline-none border-x border-ink-700/80 [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:m-0 [&::-webkit-outer-spin-button]:m-0"
           title="Font size"
         />
-        <div className="flex flex-col border-l border-ink-700/80">
-          <button
-            type="button"
-            onMouseDown={(e) => e.preventDefault()}
-            onClick={() => adjustFontSize(1)}
-            title="Increase font size"
-            className="flex-1 px-1 grid place-items-center text-ink-300 hover:text-ink-100 hover:bg-ink-600/60"
+        <button
+          type="button"
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={() => adjustFontSize(1)}
+          title="Increase font size"
+          aria-label="Increase font size"
+          className="px-1.5 grid place-items-center text-ink-300 hover:text-ink-100 hover:bg-ink-600/60"
+        >
+          <ChevronUp size={12} strokeWidth={3} />
+        </button>
+      </div>
+
+      {/* Text colour + background colour — deliberately placed flush against
+       *  the Font Size control so the three read as a single character-style
+       *  cluster (size / colour / highlight). Each button lives inside its
+       *  own `relative` wrapper so the swatch popover anchors under the
+       *  triggering button rather than to the toolbar's right edge (which
+       *  was correct when the buttons were at the tail of the bar, but
+       *  would point off-screen now that they sit in the middle). */}
+      <div className="relative">
+        <button
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={() => {
+            setColorOpen((v) => !v);
+            setBgOpen(false);
+          }}
+          title="Text colour"
+          aria-label="Text colour"
+          className={`flex items-center gap-1 h-7 px-2 rounded text-xs transition-colors ${
+            colorOpen ? "row-active" : "hover:bg-ink-700 text-ink-200"
+          }`}
+        >
+          <Palette size={13} />
+          <span
+            className="inline-block w-3.5 h-3.5 rounded-sm ring-1 ring-black/40"
+            style={{ background: text.color }}
+          />
+        </button>
+        {colorOpen && (
+          <SwatchPopover
+            label="Text colour"
+            current={text.color}
+            onPick={(c) => {
+              if (c == null) return;
+              patch({ color: c });
+              setColorOpen(false);
+            }}
           >
-            <ChevronUp size={9} strokeWidth={3} />
-          </button>
-          <button
-            type="button"
-            onMouseDown={(e) => e.preventDefault()}
-            onClick={() => adjustFontSize(-1)}
-            title="Decrease font size"
-            className="flex-1 px-1 grid place-items-center text-ink-300 hover:text-ink-100 hover:bg-ink-600/60"
+            <ColorPickerPanel
+              value={text.color}
+              onChange={(c) => patch({ color: c })}
+            />
+          </SwatchPopover>
+        )}
+      </div>
+
+      <div className="relative">
+        <button
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={() => {
+            setBgOpen((v) => !v);
+            setColorOpen(false);
+          }}
+          title="Background colour"
+          aria-label="Text background colour"
+          className={`flex items-center gap-1 h-7 px-2 rounded text-xs transition-colors ${
+            bgOpen ? "row-active" : "hover:bg-ink-700 text-ink-200"
+          }`}
+        >
+          <PaintBucket size={13} />
+          <span
+            className="inline-block w-3.5 h-3.5 rounded-sm ring-1 ring-black/40 relative overflow-hidden"
+            style={{
+              background: text.bgColor ?? "transparent",
+              backgroundImage: text.bgColor
+                ? undefined
+                : "linear-gradient(45deg, #888 25%, transparent 25%, transparent 75%, #888 75%), linear-gradient(45deg, #888 25%, transparent 25%, transparent 75%, #888 75%)",
+              backgroundSize: text.bgColor ? undefined : "6px 6px",
+              backgroundPosition: text.bgColor ? undefined : "0 0, 3px 3px",
+            }}
+          />
+        </button>
+        {bgOpen && (
+          <SwatchPopover
+            label="Background colour"
+            current={text.bgColor ?? null}
+            allowNone
+            onPick={(c) => {
+              patch({ bgColor: c ?? undefined });
+              setBgOpen(false);
+            }}
           >
-            <ChevronDown size={9} strokeWidth={3} />
-          </button>
-        </div>
+            <ColorPickerPanel
+              value={text.bgColor ?? "#ffffff"}
+              onChange={(c) => patch({ bgColor: c })}
+            />
+          </SwatchPopover>
+        )}
       </div>
 
       <Divider />
@@ -263,6 +396,13 @@ export function TextFormatBar() {
         title="Align right"
       >
         <AlignRight size={13} />
+      </ToggleBtn>
+      <ToggleBtn
+        active={text.align === "justify"}
+        onClick={() => patch({ align: "justify" })}
+        title="Justify"
+      >
+        <AlignJustify size={13} />
       </ToggleBtn>
 
       <Divider />
@@ -392,85 +532,6 @@ export function TextFormatBar() {
       >
         <IndentIncrease size={13} />
       </ToggleBtn>
-
-      <Divider />
-
-      <button
-        onMouseDown={(e) => e.preventDefault()}
-        onClick={() => {
-          setColorOpen((v) => !v);
-          setBgOpen(false);
-        }}
-        title="Text colour"
-        className={`flex items-center gap-1 h-7 px-2 rounded text-xs transition-colors ${
-          colorOpen ? "row-active" : "hover:bg-ink-700 text-ink-200"
-        }`}
-      >
-        <Palette size={13} />
-        <span
-          className="inline-block w-3.5 h-3.5 rounded-sm ring-1 ring-black/40"
-          style={{ background: text.color }}
-        />
-      </button>
-
-      <button
-        onMouseDown={(e) => e.preventDefault()}
-        onClick={() => {
-          setBgOpen((v) => !v);
-          setColorOpen(false);
-        }}
-        title="Background colour"
-        className={`flex items-center gap-1 h-7 px-2 rounded text-xs transition-colors ${
-          bgOpen ? "row-active" : "hover:bg-ink-700 text-ink-200"
-        }`}
-      >
-        <PaintBucket size={13} />
-        <span
-          className="inline-block w-3.5 h-3.5 rounded-sm ring-1 ring-black/40 relative overflow-hidden"
-          style={{
-            background: text.bgColor ?? "transparent",
-            backgroundImage: text.bgColor
-              ? undefined
-              : "linear-gradient(45deg, #888 25%, transparent 25%, transparent 75%, #888 75%), linear-gradient(45deg, #888 25%, transparent 25%, transparent 75%, #888 75%)",
-            backgroundSize: text.bgColor ? undefined : "6px 6px",
-            backgroundPosition: text.bgColor ? undefined : "0 0, 3px 3px",
-          }}
-        />
-      </button>
-
-      {colorOpen && (
-        <SwatchPopover
-          label="Text colour"
-          current={text.color}
-          onPick={(c) => {
-            if (c == null) return;
-            patch({ color: c });
-            setColorOpen(false);
-          }}
-        >
-          <ColorPickerPanel
-            value={text.color}
-            onChange={(c) => patch({ color: c })}
-          />
-        </SwatchPopover>
-      )}
-
-      {bgOpen && (
-        <SwatchPopover
-          label="Background colour"
-          current={text.bgColor ?? null}
-          allowNone
-          onPick={(c) => {
-            patch({ bgColor: c ?? undefined });
-            setBgOpen(false);
-          }}
-        >
-          <ColorPickerPanel
-            value={text.bgColor ?? "#ffffff"}
-            onChange={(c) => patch({ bgColor: c })}
-          />
-        </SwatchPopover>
-      )}
     </div>
   );
 }
@@ -490,7 +551,13 @@ function SwatchPopover({
 }) {
   return (
     <div
-      className="absolute top-full mt-2 right-0 z-40 panel rounded-md shadow-2xl p-3 w-64"
+      // `left-0` anchors the popover under the triggering color button (each
+      // button is wrapped in a `relative` container in the parent bar). The
+      // previous `right-0` made sense when the colour buttons lived at the
+      // very end of the toolbar; after the move next to Font Size, `left-0`
+      // keeps the popover on-screen by extending rightward into the bar's
+      // remaining width rather than spilling off the left edge.
+      className="absolute top-full mt-2 left-0 z-40 panel rounded-md shadow-2xl p-3 w-64"
       style={{ background: "var(--bg-secondary)" }}
     >
       <div className="text-[10px] uppercase tracking-wider text-ink-400 mb-2">

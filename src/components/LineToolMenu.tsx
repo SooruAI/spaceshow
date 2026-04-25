@@ -7,25 +7,35 @@
  *   2. A line shape is currently selected (via canvas click or the left
  *      sidebar) — menu edits that specific shape in-place.
  *
- * Four sections: Type (routing), Style (weight + pattern), Ends (markers +
- * swap), and Color + Opacity.
+ * Section order (left → right):
+ *   Type · Pattern · Weight · Ends · Color · [Lock · Hide · More]
+ *
+ * The trailing [Lock · Hide · More] group targets a specific shape, so
+ * it only renders in editing mode. In tool-only mode the bar still shows
+ * the drawing defaults so picking up the Line tool previews what the
+ * next stroke will look like.
  */
 
 import { useStore } from "../store";
-import {
-  LINE_PATTERNS,
-  LINE_ROUTINGS,
-} from "../types";
 import type {
   LineMarkerKind,
   LinePattern,
   LineRouting,
   LineShape,
 } from "../types";
-import { SegmentedControl } from "./lineTool/SegmentedControl";
+import { RoutingDropdown } from "./lineTool/RoutingDropdown";
+import { PatternDropdown } from "./lineTool/PatternDropdown";
 import { MarkerDropdown } from "./lineTool/MarkerDropdown";
-import { ColorSwatches } from "./lineTool/ColorSwatches";
-import { ArrowLeftRight } from "lucide-react";
+import { ColorDropdown } from "./lineTool/ColorDropdown";
+import { RULER_SIZE } from "./Rulers";
+import {
+  ArrowLeftRight,
+  Eye,
+  EyeOff,
+  Lock,
+  MoreHorizontal,
+  Unlock,
+} from "lucide-react";
 
 export function LineToolMenu() {
   const tool = useStore((s) => s.tool);
@@ -54,6 +64,7 @@ export function LineToolMenu() {
   const tSetColor = useStore((s) => s.setToolColor);
 
   const updateShape = useStore((s) => s.updateShape);
+  const openContextMenu = useStore((s) => s.openContextMenu);
 
   // Render only when there's a surface to configure.
   if (tool !== "line" && !selectedLine) return null;
@@ -69,14 +80,15 @@ export function LineToolMenu() {
   const opacity = editing?.opacity ?? (editing ? 1 : tOpacity);
   const color = editing ? editing.stroke ?? "#2c2a27" : tColor;
 
-  const opacityPct = Math.round(opacity * 100);
-
   // Writers — dispatch to the selected line if we have one, else to the
   // tool-default store slots.
   const setRouting = (r: LineRouting) =>
     editing ? updateShape(editing.id, { routing: r }) : tSetRouting(r);
   const setWeight = (w: number) => {
-    const clamped = Math.max(0, Math.min(10, Math.round(w * 2) / 2));
+    // 0..100 px matches the SheetToolbar's "Stroke" slider range so the two
+    // surfaces agree on the max thickness a line can have. Integer steps
+    // keep the control predictable across its full range.
+    const clamped = Math.max(0, Math.min(100, Math.round(w)));
     if (editing) updateShape(editing.id, { strokeWidth: clamped });
     else tSetWeight(clamped);
   };
@@ -106,16 +118,60 @@ export function LineToolMenu() {
     else tSetColor("line", hex);
   };
 
+  // ─── Trailing-group handlers (editing-mode only) ───
+  const toggleLock = () => {
+    if (!editing) return;
+    updateShape(editing.id, { locked: !editing.locked });
+  };
+  const toggleVisible = () => {
+    if (!editing) return;
+    updateShape(editing.id, { visible: !editing.visible });
+  };
+  // The existing <ContextMenu /> (mounted by App.tsx) handles Duplicate /
+  // Cut / Copy / Paste / Delete / Rename / etc. — we just aim it at the
+  // selected line from under the 3-dots button.
+  const openMore = (e: React.MouseEvent<HTMLButtonElement>) => {
+    if (!editing) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    openContextMenu({
+      x: rect.left,
+      y: rect.bottom + 4,
+      target: "element",
+      elementId: editing.id,
+    });
+  };
+
   return (
     <div
       role="toolbar"
       aria-label="Line tool options"
-      className="absolute top-4 left-1/2 -translate-x-1/2 z-20 panel rounded-xl shadow-pop px-2.5 py-2 flex flex-wrap items-center gap-2 max-w-[calc(100%-2rem)]"
+      // `flex-nowrap` + `whitespace-nowrap` pin every section onto a single
+      // row.
+      //
+      // Deliberately no `overflow-*` / `max-w-*`: every section here is a
+      // dropdown trigger whose popover is an `absolute top-full` child
+      // that needs to escape the toolbar's bounds vertically. CSS
+      // promotes the other axis to `auto` when one is non-visible, so
+      // setting `overflow-x-auto` here clips every RoutingDropdown /
+      // PatternDropdown / MarkerDropdown / ColorDropdown popover at the
+      // bottom edge of the bar. Let the strip size to its content and
+      // render in front of the canvas; on ultra-narrow viewports it may
+      // extend beyond the viewport edges, which is acceptable given
+      // that centering via `left-1/2 -translate-x-1/2` is a pre-existing
+      // constraint.
+      //
+      // Vertical position: `RULER_SIZE + 8` clears the horizontal ruler
+      // with 8px of breathing room, matching every other floating
+      // toolbar (SheetToolbar, TextFormatBar, StickyFormatBar,
+      // ImageOptionsBar). Horizontal centering via `left-1/2
+      // -translate-x-1/2` keeps it clear of the vertical ruler on the
+      // left at normal viewport widths.
+      className="absolute left-1/2 -translate-x-1/2 z-20 panel rounded-xl shadow-pop px-2.5 py-2 flex flex-nowrap items-center gap-2 whitespace-nowrap"
+      style={{ top: RULER_SIZE + 8 }}
     >
       {/* ─── Type (routing) ─── */}
       <Section label="Type">
-        <SegmentedControl
-          options={LINE_ROUTINGS}
+        <RoutingDropdown
           value={routing}
           onChange={setRouting}
           ariaLabel="Line routing"
@@ -124,31 +180,37 @@ export function LineToolMenu() {
 
       <Separator />
 
-      {/* ─── Weight + Pattern ─── */}
+      {/* ─── Pattern ─── */}
+      <Section label="Pattern">
+        <PatternDropdown
+          value={pattern}
+          onChange={setPattern}
+          ariaLabel="Line pattern"
+        />
+      </Section>
+
+      <Separator />
+
+      {/* ─── Weight ─── */}
       <Section label="Weight">
         <input
           type="range"
           min={0}
-          max={10}
-          step={0.5}
+          max={100}
+          step={1}
           value={weight}
           onChange={(e) => setWeight(parseFloat(e.target.value))}
           aria-label="Line weight"
           aria-valuenow={weight}
           aria-valuemin={0}
-          aria-valuemax={10}
-          aria-valuetext={String(weight)}
+          aria-valuemax={100}
+          aria-valuetext={`${weight}px`}
           className="line-tool-range w-20"
         />
-        <span className="text-[11px] tabular-nums w-6 text-right text-ink-300">
+        {/* w-8 so a 3-digit value like "100" doesn't overflow the badge. */}
+        <span className="text-[11px] tabular-nums w-8 text-right text-ink-300">
           {weight}
         </span>
-        <SegmentedControl
-          options={LINE_PATTERNS}
-          value={pattern}
-          onChange={setPattern}
-          ariaLabel="Line pattern"
-        />
       </Section>
 
       <Separator />
@@ -182,30 +244,45 @@ export function LineToolMenu() {
 
       <Separator />
 
-      {/* ─── Color + Opacity ─── */}
+      {/* ─── Color (dropdown — swatches + opacity live inside the popover,
+          mirroring the Pen / Shape tool pattern in SheetToolbar.tsx) ─── */}
       <Section label="Color">
-        <ColorSwatches value={color} onChange={setColor} />
-        <span className="text-[10px] uppercase tracking-wide text-ink-300 ml-1">
-          Opacity
-        </span>
-        <input
-          type="range"
-          min={0}
-          max={100}
-          step={1}
-          value={opacityPct}
-          onChange={(e) => setOpacity(parseInt(e.target.value, 10) / 100)}
-          aria-label="Line opacity"
-          aria-valuenow={opacityPct}
-          aria-valuemin={0}
-          aria-valuemax={100}
-          aria-valuetext={`${opacityPct}%`}
-          className="line-tool-range w-20"
+        <ColorDropdown
+          color={color}
+          opacity={opacity}
+          onColorChange={setColor}
+          onOpacityChange={setOpacity}
         />
-        <span className="text-[11px] tabular-nums w-9 text-right text-ink-300">
-          {opacityPct}%
-        </span>
       </Section>
+
+      {/* ─── Lock / Hide / More (editing-mode only) ───
+          Mirrors the visual family used by SelectionToolbar so the
+          per-shape actions read as a clearly separated trailing group. */}
+      {editing && (
+        <>
+          <Separator />
+          <div className="flex items-center gap-0.5">
+            <TrailingButton
+              title={editing.locked ? "Unlock" : "Lock"}
+              ariaLabel={editing.locked ? "Unlock line" : "Lock line"}
+              onClick={toggleLock}
+              Icon={editing.locked ? Unlock : Lock}
+            />
+            <TrailingButton
+              title={editing.visible ? "Hide" : "Unhide"}
+              ariaLabel={editing.visible ? "Hide line" : "Unhide line"}
+              onClick={toggleVisible}
+              Icon={editing.visible ? Eye : EyeOff}
+            />
+            <TrailingButton
+              title="More actions"
+              ariaLabel="More actions"
+              onClick={openMore}
+              Icon={MoreHorizontal}
+            />
+          </div>
+        </>
+      )}
     </div>
   );
 }
@@ -233,5 +310,31 @@ function Separator() {
       aria-hidden="true"
       className="self-stretch w-px bg-ink-700 mx-0.5"
     />
+  );
+}
+
+/** Icon-only button styled to match SelectionToolbar's ToolbarButton —
+ *  keeps the per-shape actions visually grouped across the two surfaces. */
+function TrailingButton({
+  title,
+  ariaLabel,
+  onClick,
+  Icon,
+}: {
+  title: string;
+  ariaLabel: string;
+  onClick: (e: React.MouseEvent<HTMLButtonElement>) => void;
+  Icon: React.ComponentType<{ size?: number; className?: string }>;
+}) {
+  return (
+    <button
+      type="button"
+      title={title}
+      aria-label={ariaLabel}
+      onClick={onClick}
+      className="w-7 h-7 inline-flex items-center justify-center rounded text-ink-100 hover:bg-ink-700/60 transition-colors"
+    >
+      <Icon size={14} />
+    </button>
   );
 }

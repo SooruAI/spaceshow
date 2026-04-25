@@ -15,9 +15,19 @@ import useImage from "use-image";
 import type Konva from "konva";
 import { KIND_RENDERER, shapePathFor } from "../lib/shapePaths";
 import { formatListLines } from "../lib/listFormat";
+import {
+  autoSmoothTangents,
+  buildRoundedElbowPath,
+  computeArcPath,
+  computeElbowPath,
+  computeMultiAnchorPath,
+  resolveCurveAnchors,
+} from "../lib/lineRouting";
+import { LineMarkerEnds } from "./lineTool/LineMarkerEnds";
 import type {
   EraseMark,
   ImageShape,
+  LinePattern,
   LineStyle,
   PenShape,
   Shape,
@@ -65,24 +75,119 @@ export function PresenterShape({ shape }: { shape: Shape }) {
       shape.strokeWidthUnit === "world"
         ? (shape.strokeWidth ?? 1)
         : (shape.strokeWidth ?? 1);
+    // Presenter renders inside a `<Group scaleX={fit} scaleY={fit}>` so
+    // zoom is effectively 1 from the dash array's perspective — pass 1
+    // unconditionally. Pattern behaviour otherwise matches Canvas.tsx's
+    // `dashForLinePattern` (1-unit dot + round-cap -> circular dots,
+    // 3:2 dash-to-gap ratio scaled by strokeWidth).
+    const dash = dashForLinePattern(shape.pattern ?? "solid", shape.strokeWidth ?? 1);
+    const routing = shape.routing ?? "straight";
+    // "Rounded edge" is a stroke property — see Canvas.tsx for the full
+    // rationale. Dotted always forces round caps (the 1-unit dash +
+    // round cap is what produces the circular dot). Otherwise, butt by
+    // default and round whenever either end marker asks for it.
+    const isDotted = (shape.pattern ?? "solid") === "dotted";
+    const wantsRoundedEdge =
+      shape.startMarker === "roundedEdge" ||
+      shape.endMarker === "roundedEdge";
+    const lineCap: "round" | "butt" =
+      isDotted || wantsRoundedEdge ? "round" : "butt";
+    const commonLineProps = {
+      stroke: shape.stroke,
+      strokeWidth,
+      opacity: shape.opacity ?? 1,
+      lineCap,
+      lineJoin: "round" as const,
+      dash,
+      listening: false,
+    };
+    // Zoom = 1 because the fit-scale is baked into PresenterView's
+    // parent `<Group scaleX={fit} scaleY={fit}>` — the marker sizes
+    // then inherit that transform naturally, same as the stroke.
+    const markers = <LineMarkerEnds shape={shape} zoom={1} />;
+    if (routing === "curved" && shape.points.length >= 4) {
+      // Multi-anchor cubic Bézier spline. Mirrors Canvas.tsx's render
+      // path exactly: `resolveCurveAnchors` returns `shape.curveAnchors`
+      // when defined, otherwise derives a three-anchor spline from the
+      // legacy (curvature, curvature2) scalars whose path is byte-
+      // identical to the old two-pill renderer. `autoSmoothTangents`
+      // fills in any missing in/out handles so interior bends read as
+      // C1-smooth joins.
+      const anchors = autoSmoothTangents(resolveCurveAnchors(shape));
+      const d = computeMultiAnchorPath(anchors);
+      return (
+        <>
+          <KPath data={d} {...commonLineProps} />
+          {markers}
+        </>
+      );
+    }
+    if (routing === "arc" && shape.points.length >= 4) {
+      // Three-point circular arc. Mirrors the editor's render path —
+      // `computeArcPath` handles both length-4 (derived mid) and
+      // length-6 (stored mid) layouts, and returns `degenerate: true`
+      // for collinear triples so we fall back to a plain <Line> with
+      // clean stroke caps.
+      const { d, degenerate } = computeArcPath(shape.points);
+      if (degenerate) {
+        const n = shape.points.length;
+        return (
+          <>
+            <Line
+              points={[
+                shape.points[0],
+                shape.points[1],
+                shape.points[n - 2],
+                shape.points[n - 1],
+              ]}
+              {...commonLineProps}
+            />
+            {markers}
+          </>
+        );
+      }
+      return (
+        <>
+          <KPath data={d} {...commonLineProps} />
+          {markers}
+        </>
+      );
+    }
+    if (routing === "elbow") {
+      const polyline =
+        shape.points.length >= 6
+          ? shape.points
+          : computeElbowPath(shape.points, shape.elbowOrientation ?? "HV");
+      // Presenter has no zoom — elbow corner radius is chosen in world
+      // units so it reads as a hand-rounded curve at typical slide sizes.
+      const d = buildRoundedElbowPath(polyline, 12);
+      return (
+        <>
+          <KPath data={d} {...commonLineProps} />
+          {markers}
+        </>
+      );
+    }
     return (
-      <Line
-        points={shape.points}
-        stroke={shape.stroke}
-        strokeWidth={strokeWidth}
-        opacity={shape.opacity ?? 1}
-        lineCap="round"
-        listening={false}
-      />
+      <>
+        <Line points={shape.points} {...commonLineProps} />
+        {markers}
+      </>
     );
   }
   if (shape.type === "sticky") {
+    // Stickies are filtered out of presentation by PresenterView (they live
+    // on `sheetId === "board"` and the per-slide filter only includes shapes
+    // matching the active sheet id). This branch survives only as a safety
+    // net for legacy stickies that were placed on a sheet before the
+    // canvas-level enforcement landed. Renders the legacy `text` field as a
+    // simple plain-text note — header/body rich-text is never reached here.
     return (
       <Group x={shape.x} y={shape.y} listening={false}>
         <Rect
           width={shape.width}
           height={shape.height}
-          fill={shape.fill}
+          fill={shape.bgColor ?? shape.fill ?? "#fef3c7"}
           stroke="#e0c060"
           strokeWidth={1}
           cornerRadius={4}
@@ -91,7 +196,7 @@ export function PresenterShape({ shape }: { shape: Shape }) {
           shadowOffset={{ x: 0, y: 2 }}
         />
         <Text
-          text={shape.text}
+          text={shape.body?.text ?? shape.text ?? ""}
           x={10}
           y={10}
           width={shape.width - 20}
@@ -115,6 +220,24 @@ function dashFor(style: LineStyle, weight: number): number[] | undefined {
   if (style === "dashed")
     return [Math.max(4, weight * 3), Math.max(3, weight * 2)];
   return undefined;
+}
+
+/**
+ * Dash pattern for a Line-shape's stroke — mirrors Canvas.tsx's
+ * `dashForLinePattern`. The editor helper does zoom-aware unit
+ * conversion; the presenter doesn't (fit-scale is baked into the
+ * parent Group), so this is just the base formula.
+ */
+function dashForLinePattern(
+  pattern: LinePattern,
+  baseStrokeWidth: number,
+): number[] | undefined {
+  if (pattern === "solid") return undefined;
+  const w = Math.max(0.5, baseStrokeWidth);
+  if (pattern === "dashed")
+    return [Math.max(4, w * 3), Math.max(3, w * 2)];
+  // dotted: 1-unit dash plus round line cap = circular dot of ~w diameter.
+  return [1, Math.max(2, w * 1.5)];
 }
 
 function fontStyleFor(bold: boolean, italic: boolean): string {

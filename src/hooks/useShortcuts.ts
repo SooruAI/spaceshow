@@ -125,8 +125,20 @@ export function useShortcuts() {
         return;
       }
 
+      // ----- Enter: commit an in-progress crop -----
+      if (key === "Enter" && s.croppingImageId) {
+        e.preventDefault();
+        s.endImageCrop(true);
+        return;
+      }
+
       // ----- Escape: clear selection / close overlays -----
       if (key === "Escape") {
+        if (s.croppingImageId) {
+          e.preventDefault();
+          s.endImageCrop(false);
+          return;
+        }
         if (s.editingTextShapeId) {
           s.endTextEdit();
           return;
@@ -197,9 +209,35 @@ export function useShortcuts() {
         }
       }
       if (mod && !e.shiftKey && lower === "x") {
+        // Multi-selection cut: copy the batch to the multi clipboard, then
+        // delete each. Mirrors the context menu's handleCut path (no
+        // dedicated multi-cut store action, so we compose one). Same
+        // coalesce pattern as multi-duplicate so the whole cut is a single
+        // undo step.
+        if (s.selectedShapeIds.length + s.selectedSheetIds.length > 1) {
+          e.preventDefault();
+          s.beginHistoryCoalesce(`multi-cut-${Date.now()}`);
+          s.copyMultiToClip(s.selectedShapeIds, s.selectedSheetIds);
+          s.selectedShapeIds.forEach((id) => s.deleteShape(id));
+          // Sheet deletion guarded by the same "keep at least one sheet
+          // around" rule as Mod+Backspace — we can't leave the board empty.
+          if (s.sheets.length > s.selectedSheetIds.length) {
+            s.selectedSheetIds.forEach((id) => s.deleteSheet(id));
+          }
+          s.endHistoryCoalesce();
+          return;
+        }
         if (s.selectedShapeId) {
           e.preventDefault();
           s.cutShape(s.selectedShapeId);
+          return;
+        }
+        // Single-sheet cut: copy to sheet clipboard, then delete. Same
+        // "at least one sheet" guard as multi.
+        if (s.selectedSheetId && s.sheets.length > 1) {
+          e.preventDefault();
+          s.copySheetToClip(s.selectedSheetId);
+          s.deleteSheet(s.selectedSheetId);
           return;
         }
       }

@@ -12,17 +12,19 @@ export const KIND_RENDERER: Record<ShapeKind, ShapeRenderer> = {
   rectangle: "rect",
   ellipse: "ellipse",
   triangle: "polygon",
-  star: "star",
-  cloud: "path",
-  diamond: "path",
-  heart: "path",
-  rhombus: "path",
-  tickbox: "path",
   polygon: "polygon",
+  diamond: "path",
+  star: "star",
+  heart: "path",
+  cloud: "path",
   "arrow-left": "path",
   "arrow-right": "path",
   "arrow-up": "path",
   "arrow-down": "path",
+  tickbox: "path",
+  radio: "path",
+  toggle: "path",
+  slider: "path",
 };
 
 /**
@@ -43,11 +45,6 @@ export function shapePathFor(
       const cx = W / 2;
       const cy = H / 2;
       return `M ${cx} 0 L ${W} ${cy} L ${cx} ${H} L 0 ${cy} Z`;
-    }
-    case "rhombus": {
-      // Slanted parallelogram. Top-left vertex is offset by 20% of width.
-      const off = W * 0.2;
-      return `M ${off} 0 L ${W} 0 L ${W - off} ${H} L 0 ${H} Z`;
     }
     case "heart": {
       // Two arcs forming the lobes, meeting at the apex point.
@@ -84,6 +81,66 @@ export function shapePathFor(
         `M ${W * 0.22} ${H * 0.5} L ${W * 0.45} ${H * 0.72} ` +
         `L ${W * 0.78} ${H * 0.28}`
       );
+    }
+    case "radio": {
+      // Outer disc (CW) + middle disc (CCW) + center dot (CW). Counter-winding
+      // the middle so the default canvas nonzero fill rule paints a ring +
+      // dot — no need to bolt fill-rule="evenodd" onto Konva.Path.
+      const cx = W / 2;
+      const cy = H / 2;
+      const R = Math.min(W, H) / 2;
+      const ringInner = R * 0.65;   // inner cutout radius — controls ring thickness
+      const dot = R * 0.32;          // center dot radius
+      return (
+        `M ${cx - R} ${cy} A ${R} ${R} 0 1 1 ${cx + R} ${cy} ` +
+        `A ${R} ${R} 0 1 1 ${cx - R} ${cy} Z ` +
+        `M ${cx - ringInner} ${cy} A ${ringInner} ${ringInner} 0 1 0 ${cx + ringInner} ${cy} ` +
+        `A ${ringInner} ${ringInner} 0 1 0 ${cx - ringInner} ${cy} Z ` +
+        `M ${cx - dot} ${cy} A ${dot} ${dot} 0 1 1 ${cx + dot} ${cy} ` +
+        `A ${dot} ${dot} 0 1 1 ${cx - dot} ${cy} Z`
+      );
+    }
+    case "toggle": {
+      // Stadium pill (CW) with a counter-wound handle disc on the right that
+      // subtracts a circular hole. Reads as a toggle in any combination of
+      // fill / stroke styling: outline-only shows pill + handle ring; filled
+      // shows a solid pill with the handle's silhouette punched through.
+      const radius = H / 2;
+      const outer =
+        `M ${radius} 0 H ${W - radius} ` +
+        `A ${radius} ${radius} 0 0 1 ${W - radius} ${H} ` +
+        `H ${radius} ` +
+        `A ${radius} ${radius} 0 0 1 ${radius} 0 Z`;
+      const handleR = radius * 0.7;
+      const hcx = W - radius;
+      const hcy = H / 2;
+      // CCW handle (sweep=0) → cut a hole via nonzero fill rule.
+      const handle =
+        `M ${hcx - handleR} ${hcy} ` +
+        `A ${handleR} ${handleR} 0 1 0 ${hcx + handleR} ${hcy} ` +
+        `A ${handleR} ${handleR} 0 1 0 ${hcx - handleR} ${hcy} Z`;
+      return `${outer} ${handle}`;
+    }
+    case "slider": {
+      // Thin horizontal track (stadium) plus a larger handle disc at the
+      // midpoint. Both wound CW so they're additive — the handle bulges
+      // above and below the track and reads as the slider thumb.
+      const trackH = Math.max(2, H * 0.22);
+      const trackY = (H - trackH) / 2;
+      const trackR = trackH / 2;
+      const handleR = Math.min(H * 0.46, W * 0.18);
+      const hcx = W / 2;
+      const hcy = H / 2;
+      const track =
+        `M ${trackR} ${trackY} H ${W - trackR} ` +
+        `A ${trackR} ${trackR} 0 0 1 ${W - trackR} ${trackY + trackH} ` +
+        `H ${trackR} ` +
+        `A ${trackR} ${trackR} 0 0 1 ${trackR} ${trackY} Z`;
+      const handle =
+        `M ${hcx - handleR} ${hcy} ` +
+        `A ${handleR} ${handleR} 0 1 1 ${hcx + handleR} ${hcy} ` +
+        `A ${handleR} ${handleR} 0 1 1 ${hcx - handleR} ${hcy} Z`;
+      return `${track} ${handle}`;
     }
     case "arrow-right": {
       const headW = Math.min(W * 0.35, H * 0.5);
@@ -137,15 +194,17 @@ export const KIND_LABEL: Record<ShapeKind, string> = {
   rectangle: "Rectangle",
   ellipse: "Ellipse",
   triangle: "Triangle",
-  star: "Star",
-  cloud: "Cloud",
-  diamond: "Diamond",
-  heart: "Heart",
-  rhombus: "Rhombus",
-  tickbox: "Tickbox",
   polygon: "Polygon",
+  diamond: "Diamond",
+  star: "Star",
+  heart: "Heart",
+  cloud: "Cloud",
   "arrow-left": "Arrow Left",
   "arrow-right": "Arrow Right",
   "arrow-up": "Arrow Up",
   "arrow-down": "Arrow Down",
+  tickbox: "Tickbox",
+  radio: "Radio",
+  toggle: "Toggle",
+  slider: "Slider",
 };

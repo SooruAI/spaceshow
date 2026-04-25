@@ -29,6 +29,28 @@ export function MarkerPreview({
   const height = size;
   const width = size * aspect;
 
+  // Stub length splits on "where does the glyph sit relative to the
+  // endpoint?":
+  //   • at / within the endpoint — stub extends the full viewBox so
+  //     the glyph overlaps its tail. Arrows live here (tip = endpoint,
+  //     tail pulled back into the line), as do the cap-only markers
+  //     (none, roundedEdge).
+  //   • past the endpoint — stub stops short and the glyph fills the
+  //     trailing segment. Circles / squares / diamonds live here.
+  //
+  // "None" additionally uses a butt cap and "roundedEdge" bumps the
+  // stub width so users can actually see the cap style in the
+  // dropdown swatch.
+  const glyphWithinLine =
+    kind === "none" ||
+    kind === "roundedEdge" ||
+    kind === "standardArrow" ||
+    kind === "solidArrow" ||
+    kind === "flatBar";
+  const stubX2 = glyphWithinLine ? VIEW_W - 2 : VIEW_W - 10;
+  const stubCap = kind === "none" ? "butt" : "round";
+  const stubWidth = kind === "roundedEdge" ? 3 : 1.5;
+
   return (
     <svg
       width={width}
@@ -44,29 +66,15 @@ export function MarkerPreview({
             : undefined
         }
       >
-        {/* Shared connector stub so glyphs read as "end of a line". */}
-        {kind !== "none" && (
-          <line
-            x1={2}
-            y1={VIEW_H / 2}
-            x2={VIEW_W - 10}
-            y2={VIEW_H / 2}
-            stroke={color}
-            strokeWidth={1.5}
-            strokeLinecap="round"
-          />
-        )}
-        {kind === "none" && (
-          <line
-            x1={2}
-            y1={VIEW_H / 2}
-            x2={VIEW_W - 2}
-            y2={VIEW_H / 2}
-            stroke={color}
-            strokeWidth={1.5}
-            strokeLinecap="round"
-          />
-        )}
+        <line
+          x1={2}
+          y1={VIEW_H / 2}
+          x2={stubX2}
+          y2={VIEW_H / 2}
+          stroke={color}
+          strokeWidth={stubWidth}
+          strokeLinecap={stubCap}
+        />
         {renderGlyph(kind, color)}
       </g>
     </svg>
@@ -177,6 +185,12 @@ function renderGlyph(kind: LineMarkerKind, color: string) {
           strokeLinecap="round"
         />
       );
+
+    case "roundedEdge":
+      // The round cap is drawn by the connector stub itself (thicker
+      // stroke + strokeLinecap="round") — see MarkerPreview. There's no
+      // separate glyph to paint here.
+      return null;
 
     default:
       return null;

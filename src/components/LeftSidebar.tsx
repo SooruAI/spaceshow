@@ -7,6 +7,7 @@ import {
   ChevronDown,
   ChevronRight,
   Circle,
+  CircleDot,
   Cloud,
   Diamond,
   FileText,
@@ -18,9 +19,11 @@ import {
   Octagon,
   PanelLeftClose,
   Pen,
+  SlidersHorizontal,
   Square,
   Star,
   StickyNote,
+  ToggleRight,
   Triangle,
   Type,
 } from "lucide-react";
@@ -50,17 +53,19 @@ function shapeIcon(sh: Shape) {
       case "rectangle": return <Square size={12} />;
       case "ellipse": return <Circle size={12} />;
       case "triangle": return <Triangle size={12} />;
-      case "star": return <Star size={12} />;
-      case "cloud": return <Cloud size={12} />;
-      case "diamond": return <Diamond size={12} />;
-      case "heart": return <Heart size={12} />;
-      case "rhombus": return <Diamond size={12} />;
-      case "tickbox": return <CheckSquare size={12} />;
       case "polygon": return <Hexagon size={12} />;
+      case "diamond": return <Diamond size={12} />;
+      case "star": return <Star size={12} />;
+      case "heart": return <Heart size={12} />;
+      case "cloud": return <Cloud size={12} />;
       case "arrow-left": return <ArrowLeft size={12} />;
       case "arrow-right": return <ArrowRight size={12} />;
       case "arrow-up": return <ArrowUp size={12} />;
       case "arrow-down": return <ArrowDown size={12} />;
+      case "tickbox": return <CheckSquare size={12} />;
+      case "radio": return <CircleDot size={12} />;
+      case "toggle": return <ToggleRight size={12} />;
+      case "slider": return <SlidersHorizontal size={12} />;
       default: return <Octagon size={12} />;
     }
   }
@@ -169,6 +174,14 @@ export function LeftSidebar() {
 function LayersTab() {
   const sheets = useStore((s) => s.sheets);
   const shapes = useStore((s) => s.shapes);
+  const canvasGroups = useStore((s) => s.canvasGroups);
+  const selectedShapeIds = useStore((s) => s.selectedShapeIds);
+  const selectedSheetIds = useStore((s) => s.selectedSheetIds);
+  const createCanvasGroup = useStore((s) => s.createCanvasGroup);
+  const dissolveCanvasGroup = useStore((s) => s.dissolveCanvasGroup);
+  const removeFromCanvasGroup = useStore((s) => s.removeFromCanvasGroup);
+  const selectShape = useStore((s) => s.selectShape);
+  const setSelectedSheetIds = useStore((s) => s.setSelectedSheetIds);
 
   // Reverse so the sidebar reads top→bottom as highest z-index → lowest,
   // matching the per-sheet treatment below and the Konva draw order.
@@ -184,11 +197,83 @@ function LayersTab() {
   const scrollRef = useRef<HTMLDivElement>(null);
   const { dragProps, insertionLine } = useSidebarDragReorder(scrollRef);
 
+  // ── Canvas-group create gate ─────────────────────────────────────────
+  // The "Group" button shows only when ≥2 top-level entities are selected
+  // (sheets + shapes counted together). Clicking creates a new canvas group
+  // containing exactly those members; deselects after to surface the new
+  // group row in the list. The store action de-dupes if any of the members
+  // were already in another canvas group (it reassigns).
+  const totalSelected = selectedShapeIds.length + selectedSheetIds.length;
+  const canCreateCanvasGroup = totalSelected >= 2;
+  function handleCreateCanvasGroup() {
+    if (!canCreateCanvasGroup) return;
+    createCanvasGroup({
+      sheetIds: [...selectedSheetIds],
+      shapeIds: [...selectedShapeIds],
+    });
+  }
+
   return (
     <div
       ref={scrollRef}
       className="relative flex-1 overflow-y-auto scroll-thin py-1"
     >
+      {/* Inline action: appears only when ≥2 top-level entities are
+          selected. Doesn't shift sheet rows down when hidden. */}
+      {canCreateCanvasGroup && (
+        <div className="px-3 mb-2">
+          <button
+            type="button"
+            onClick={handleCreateCanvasGroup}
+            title="Create canvas group from selection"
+            className="w-full inline-flex items-center justify-center gap-1.5 h-7 px-2 rounded border border-brand-500/40 bg-brand-500/10 text-brand-200 text-xs font-medium hover:bg-brand-500/20 transition-colors"
+          >
+            <GroupIcon size={12} />
+            Group {totalSelected} into canvas group
+          </button>
+        </div>
+      )}
+
+      {/* Canvas groups — collapsible header above sheets/board layers. Each
+          group lists its sheet + shape members. Members are still listed in
+          their normal section below; this is a parallel index, not a
+          re-parenting (per the canvas-groups spec — groups are flat sets of
+          top-level entities, not a new container). */}
+      {canvasGroups.length > 0 && (
+        <div className="mb-2 border-b border-ink-800 pb-2">
+          <div className="px-3 text-[10px] uppercase tracking-wider text-ink-400 mb-1">
+            Canvas groups
+          </div>
+          <div className="px-2 flex flex-col gap-1">
+            {canvasGroups.map((g) => {
+              const memberSheets = sheets.filter(
+                (s) => s.canvasGroupId === g.id
+              );
+              const memberShapes = shapes.filter(
+                (s) => s.canvasGroupId === g.id
+              );
+              return (
+                <CanvasGroupRow
+                  key={g.id}
+                  group={g}
+                  memberSheets={memberSheets}
+                  memberShapes={memberShapes}
+                  onDissolve={() => dissolveCanvasGroup(g.id)}
+                  onRemoveSheet={(id) =>
+                    removeFromCanvasGroup({ kind: "sheet", id })
+                  }
+                  onRemoveShape={(id) =>
+                    removeFromCanvasGroup({ kind: "shape", id })
+                  }
+                  onSelectSheet={(id) => setSelectedSheetIds([id])}
+                  onSelectShape={(id) => selectShape(id, false)}
+                />
+              );
+            })}
+          </div>
+        </div>
+      )}
+
       {sheets.map((sheet, idx) => (
         <SheetRow
           key={sheet.id}
@@ -221,6 +306,126 @@ function LayersTab() {
       )}
 
       {insertionLine}
+    </div>
+  );
+}
+
+// ── CanvasGroupRow ────────────────────────────────────────────────────────
+// Compact collapsible row for a single canvas group. Header shows the group
+// name + member count + a Dissolve (X) button. Body lists each member with a
+// small "Remove from group" affordance and a click-to-select handler that
+// surfaces the member on the canvas.
+//
+// Members ALSO appear in their natural sections (Sheets, Board layers) — the
+// canvas group is a flat parallel index that records "these entities drag
+// together". Dissolving removes the index entry only; nothing in the natural
+// tree changes.
+function CanvasGroupRow({
+  group,
+  memberSheets,
+  memberShapes,
+  onDissolve,
+  onRemoveSheet,
+  onRemoveShape,
+  onSelectSheet,
+  onSelectShape,
+}: {
+  group: { id: string; name: string };
+  memberSheets: { id: string; name: string }[];
+  memberShapes: Shape[];
+  onDissolve: () => void;
+  onRemoveSheet: (id: string) => void;
+  onRemoveShape: (id: string) => void;
+  onSelectSheet: (id: string) => void;
+  onSelectShape: (id: string) => void;
+}) {
+  const [open, setOpen] = useState(true);
+  const memberCount = memberSheets.length + memberShapes.length;
+  return (
+    <div className="rounded border border-ink-800 bg-ink-900/40">
+      <div className="flex items-center gap-1 px-1.5 py-1">
+        <button
+          type="button"
+          onClick={() => setOpen((v) => !v)}
+          className="w-4 h-4 grid place-items-center text-ink-400 hover:text-ink-100"
+          title={open ? "Collapse" : "Expand"}
+        >
+          {open ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
+        </button>
+        <GroupIcon size={12} className="text-ink-300" />
+        <span className="flex-1 text-xs text-ink-100 truncate" title={group.name}>
+          {group.name}
+        </span>
+        <span className="text-[10px] text-ink-400 tabular-nums">{memberCount}</span>
+        <button
+          type="button"
+          onClick={onDissolve}
+          title="Dissolve canvas group"
+          aria-label="Dissolve canvas group"
+          className="w-5 h-5 grid place-items-center rounded text-ink-400 hover:text-red-400 hover:bg-red-500/10"
+        >
+          {/* Use a simple × glyph — keeps the icon footprint small and
+              avoids importing an additional lucide icon for a one-off. */}
+          <span className="text-[13px] leading-none">×</span>
+        </button>
+      </div>
+      {open && memberCount > 0 && (
+        <div className="px-2 pb-1.5 flex flex-col gap-0.5">
+          {memberSheets.map((s) => (
+            <CanvasGroupMemberRow
+              key={`sheet-${s.id}`}
+              icon={<FileText size={11} />}
+              label={s.name}
+              onSelect={() => onSelectSheet(s.id)}
+              onRemove={() => onRemoveSheet(s.id)}
+            />
+          ))}
+          {memberShapes.map((s) => (
+            <CanvasGroupMemberRow
+              key={`shape-${s.id}`}
+              icon={shapeIcon(s)}
+              label={s.name || s.type}
+              onSelect={() => onSelectShape(s.id)}
+              onRemove={() => onRemoveShape(s.id)}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CanvasGroupMemberRow({
+  icon,
+  label,
+  onSelect,
+  onRemove,
+}: {
+  icon: React.ReactNode;
+  label: string;
+  onSelect: () => void;
+  onRemove: () => void;
+}) {
+  return (
+    <div className="group flex items-center gap-1.5 pl-4 pr-1 py-0.5 rounded text-[11px] text-ink-200 hover:bg-ink-800/60">
+      <button
+        type="button"
+        onClick={onSelect}
+        className="flex-1 inline-flex items-center gap-1.5 truncate text-left"
+        title={label}
+      >
+        <span className="text-ink-400">{icon}</span>
+        <span className="truncate">{label}</span>
+      </button>
+      <button
+        type="button"
+        onClick={onRemove}
+        title="Remove from group"
+        aria-label="Remove from group"
+        className="opacity-0 group-hover:opacity-100 w-4 h-4 grid place-items-center rounded text-ink-400 hover:text-red-400 hover:bg-red-500/10 transition-opacity"
+      >
+        <span className="text-[12px] leading-none">×</span>
+      </button>
     </div>
   );
 }

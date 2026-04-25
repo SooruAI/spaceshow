@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   ChevronDown,
   Star,
@@ -9,8 +9,17 @@ import {
   EyeOff,
   Heart,
   PanelRightClose,
+  Plus,
+  Trash2,
+  Sparkles,
 } from "lucide-react";
 import { useStore } from "../store";
+import {
+  insertViewShape,
+  viewportCenterInSheet,
+  VIEW_DRAG_MIME,
+} from "../lib/viewInsert";
+import type { ViewItem } from "../types";
 
 export function RightSidebar() {
   const iterations = useStore((s) => s.iterations);
@@ -25,7 +34,57 @@ export function RightSidebar() {
   const sort = useStore((s) => s.viewSort);
   const setSort = useStore((s) => s.setViewSort);
   const toggleFav = useStore((s) => s.toggleViewFavorite);
+  const removeView = useStore((s) => s.removeView);
   const openRightPanel = useStore((s) => s.openRightPanel);
+  const activeSheetId = useStore((s) => s.activeSheetId);
+  const showToast = useStore((s) => s.showToast);
+
+  // Local state for the view item right-click menu. Lives here (not in
+  // the global `contextMenu` slice) because that slice is canvas-scoped
+  // and toggles different action sets — keeping the views menu local
+  // avoids cross-talk and lets it close when the sidebar unmounts.
+  const [viewMenu, setViewMenu] = useState<{
+    x: number;
+    y: number;
+    view: ViewItem;
+  } | null>(null);
+
+  // Close the view menu on Escape, scroll, or mousedown outside.
+  useEffect(() => {
+    if (!viewMenu) return;
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") setViewMenu(null);
+    }
+    function onDown() {
+      setViewMenu(null);
+    }
+    window.addEventListener("keydown", onKey);
+    // Capture phase so a click on a menu item still fires its handler
+    // (the item calls setViewMenu(null) itself before this listener can
+    // race it). mousedown closes the menu before the click fires which
+    // matches the canvas ContextMenu's pattern.
+    window.addEventListener("mousedown", onDown);
+    window.addEventListener("scroll", onDown, true);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("mousedown", onDown);
+      window.removeEventListener("scroll", onDown, true);
+    };
+  }, [viewMenu]);
+
+  function handleInsert(view: ViewItem) {
+    if (!activeSheetId) {
+      showToast("No active sheet to insert into.", "error");
+      return;
+    }
+    const center = viewportCenterInSheet(activeSheetId);
+    insertViewShape(view, {
+      sheetId: activeSheetId,
+      x: center.x,
+      y: center.y,
+      center: center.center,
+    });
+  }
 
   const dropRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -153,12 +212,28 @@ export function RightSidebar() {
               key={v.id}
               className="group relative aspect-[4/3] rounded-md overflow-hidden bg-ink-800 border border-ink-700 cursor-pointer hover:border-brand-500"
               draggable
+              onDragStart={(e) => {
+                // Tag the drag with both the custom MIME (so the Canvas
+                // drop handler can recognize it) and a plain text fallback
+                // for browsers that mishandle custom MIMEs in some edge
+                // cases. The Canvas reads from the custom MIME first.
+                e.dataTransfer.effectAllowed = "copy";
+                e.dataTransfer.setData(VIEW_DRAG_MIME, v.id);
+                e.dataTransfer.setData("text/plain", v.id);
+              }}
+              onDoubleClick={() => handleInsert(v)}
+              onContextMenu={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                setViewMenu({ x: e.clientX, y: e.clientY, view: v });
+              }}
+              title="Double-click to insert. Drag onto canvas. Right-click for options."
             >
               <div
-                className={`absolute inset-0 bg-gradient-to-br ${v.thumbnail} opacity-90`}
+                className={`absolute inset-0 bg-gradient-to-br ${v.thumbnail} opacity-90 pointer-events-none`}
               />
-              <div className="absolute inset-0 bg-black/10" />
-              <div className="absolute bottom-1 left-1.5 text-[10px] text-white drop-shadow">
+              <div className="absolute inset-0 bg-black/10 pointer-events-none" />
+              <div className="absolute bottom-1 left-1.5 text-[10px] text-white drop-shadow pointer-events-none">
                 {v.name}
               </div>
               <button
@@ -188,7 +263,116 @@ export function RightSidebar() {
         </div>
       </div>
 
+      {viewMenu && (
+        <ViewContextMenu
+          x={viewMenu.x}
+          y={viewMenu.y}
+          onInsert={() => {
+            handleInsert(viewMenu.view);
+            setViewMenu(null);
+          }}
+          onDelete={() => {
+            removeView(viewMenu.view.id);
+            setViewMenu(null);
+          }}
+          onRender={() => {
+            showToast(`Render queued for ${viewMenu.view.name}.`, "info");
+            setViewMenu(null);
+          }}
+        />
+      )}
     </div>
+  );
+}
+
+/** Floating menu for the views grid right-click. Renders at viewport
+ *  coords (`position: fixed`) so it can escape the sidebar's clipping
+ *  scroll container, and flips against the right/bottom edges. */
+function ViewContextMenu({
+  x,
+  y,
+  onInsert,
+  onDelete,
+  onRender,
+}: {
+  x: number;
+  y: number;
+  onInsert: () => void;
+  onDelete: () => void;
+  onRender: () => void;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [pos, setPos] = useState<{ x: number; y: number } | null>(null);
+
+  useEffect(() => {
+    if (!ref.current) return;
+    const rect = ref.current.getBoundingClientRect();
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    const pad = 8;
+    let nx = x;
+    let ny = y;
+    if (nx + rect.width + pad > vw) nx = vw - rect.width - pad;
+    if (ny + rect.height + pad > vh) ny = vh - rect.height - pad;
+    setPos({ x: Math.max(pad, nx), y: Math.max(pad, ny) });
+  }, [x, y]);
+
+  return (
+    <div
+      ref={ref}
+      role="menu"
+      style={{
+        position: "fixed",
+        left: pos?.x ?? x,
+        top: pos?.y ?? y,
+        visibility: pos ? "visible" : "hidden",
+      }}
+      className="z-50 min-w-[140px] panel rounded-md shadow-xl py-1"
+      onMouseDown={(e) => e.stopPropagation()}
+      onContextMenu={(e) => e.preventDefault()}
+    >
+      <MenuRow icon={<Plus size={13} />} label="Insert" onClick={onInsert} />
+      <MenuRow
+        icon={<Sparkles size={13} />}
+        label="Render"
+        onClick={onRender}
+      />
+      <MenuRow
+        icon={<Trash2 size={13} />}
+        label="Delete"
+        onClick={onDelete}
+        danger
+      />
+    </div>
+  );
+}
+
+function MenuRow({
+  icon,
+  label,
+  onClick,
+  danger,
+}: {
+  icon: React.ReactNode;
+  label: string;
+  onClick: () => void;
+  danger?: boolean;
+}) {
+  return (
+    <button
+      role="menuitem"
+      onClick={onClick}
+      className={`w-full text-left px-3 py-1.5 text-sm flex items-center gap-2 ${
+        danger
+          ? "text-rose-300 hover:bg-rose-500/15"
+          : "text-ink-100 hover:bg-ink-700"
+      }`}
+    >
+      <span className="w-4 inline-flex items-center justify-center text-ink-300">
+        {icon}
+      </span>
+      {label}
+    </button>
   );
 }
 

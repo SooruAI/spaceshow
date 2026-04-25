@@ -1,12 +1,16 @@
 import { create } from "zustand";
+import type { Editor as TipTapEditor } from "@tiptap/react";
 import type {
   Attachment,
   Board,
   BulletStyle,
   Comment,
   CommentsView,
+  EditingTextTarget,
   EraserVariant,
   Guide,
+  ImageCrop,
+  ImageStyle,
   Iteration,
   LineMarkerKind,
   LinePattern,
@@ -43,6 +47,84 @@ function defaultShapeStyle(): ShapeStyle {
     fillColor: "#0d9488",
     fillOpacity: 1,
   };
+}
+
+/** Default style applied to an ImageShape whose `style` field is absent.
+ *  Per spec: border is OFF by default; when toggled on the color is black. */
+export function defaultImageStyle(): ImageStyle {
+  return {
+    borderEnabled: false,
+    borderWeight: 2,
+    borderColor: "#000000",
+    borderStyle: "solid",
+  };
+}
+
+// Top-left corner of a shape's rendered bbox, expressed in sheet-local
+// coordinates. Each shape type stores its geometry a little differently, so
+// the naive `(shape.x, shape.y)` only matches the visible top-left for the
+// rect/shape/sticky/image family. Pens wrap their points in a Group(x, y)
+// inside Canvas/PresenterShape, so the visible top-left is the shape origin
+// plus the min of the local points. Lines are rendered as a bare `<Line>`
+// without the enclosing Group, so `points[]` already carries the sheet-local
+// coords and `(shape.x, shape.y)` is a latent offset that doesn't affect what
+// the user sees. Using this consistently lets paste-at-cursor land the same
+// shape under the mouse regardless of type.
+function shapeSheetLocalTopLeft(src: Shape): { x: number; y: number } {
+  if (src.type === "line") {
+    const pts = src.points;
+    if (!pts || pts.length < 2) return { x: src.x, y: src.y };
+    let minX = Infinity;
+    let minY = Infinity;
+    for (let i = 0; i + 1 < pts.length; i += 2) {
+      if (pts[i] < minX) minX = pts[i];
+      if (pts[i + 1] < minY) minY = pts[i + 1];
+    }
+    // `curveAnchors` can extend the bbox beyond the endpoint-only `points`
+    // for multi-bend curves — the interior anchors may stick out past the
+    // start/end corners. Fold them in so the cursor really lands at the
+    // line's visible top-left.
+    if (src.curveAnchors) {
+      for (const a of src.curveAnchors) {
+        if (a.x < minX) minX = a.x;
+        if (a.y < minY) minY = a.y;
+      }
+    }
+    return { x: minX, y: minY };
+  }
+  if (src.type === "pen") {
+    const pts = src.points;
+    if (!pts || pts.length < 2) return { x: src.x, y: src.y };
+    let minPx = Infinity;
+    let minPy = Infinity;
+    for (let i = 0; i + 1 < pts.length; i += 2) {
+      if (pts[i] < minPx) minPx = pts[i];
+      if (pts[i + 1] < minPy) minPy = pts[i + 1];
+    }
+    return { x: src.x + minPx, y: src.y + minPy };
+  }
+  return { x: src.x, y: src.y };
+}
+
+// Translate every position field of a shape by (dx, dy). For rect / shape /
+// sticky / image this is just `x += dx; y += dy`. Lines need every entry of
+// `points[]` translated (they live in sheet-local space, not line-local) and
+// every anchor in `curveAnchors` if present. Pens stay simple — their points
+// are local to the shape origin, so bumping `(x, y)` carries the stroke.
+function translateShape(src: Shape, dx: number, dy: number): Shape {
+  if (dx === 0 && dy === 0) return src;
+  const base = { ...src, x: src.x + dx, y: src.y + dy } as Shape;
+  if (base.type === "line") {
+    base.points = base.points.map((v, i) => (i % 2 === 0 ? v + dx : v + dy));
+    if (base.curveAnchors) {
+      base.curveAnchors = base.curveAnchors.map((a) => ({
+        ...a,
+        x: a.x + dx,
+        y: a.y + dy,
+      }));
+    }
+  }
+  return base;
 }
 
 const A3_LAND = paperToPx("A3", "landscape");
@@ -377,7 +459,18 @@ export type GridMode = "plain" | "dots" | "lines";
 
 // History model: we snapshot only the document (sheets + shapes + guides).
 // Pan/zoom/UI flags are not undoable by design.
+//
+// `id` + `timestamp` + optional `label` are metadata for the Versions panel —
+// undo/redo themselves only consume sheets/shapes/guides.
 export interface HistorySnapshot {
+  id: string;
+  timestamp: number;
+  userId: string;
+  label?: string;
+  /** data URL JPEG thumbnail of the canvas at snapshot time. Captured by
+   *  `pushHistory` from the live Konva stage; absent if the stage isn't
+   *  mounted (e.g. during early init or in non-canvas tests). */
+  thumbnail?: string;
   sheets: Sheet[];
   shapes: Shape[];
   guides: Guide[];
@@ -404,6 +497,16 @@ interface State {
   tool: Tool;
   zoom: number; // 0..4 (0%..400%)
   pan: { x: number; y: number };
+  /**
+   * Size of the canvas viewport (the flex-1 wrapper around the Konva Stage,
+   * not the window). App.tsx keeps this in sync via its ResizeObserver so
+   * store-side actions that need to position/scale against the real drawable
+   * area — `zoomToSheet`, future centering logic, etc. — can read it without
+   * prop-drilling. `window.innerWidth/Height` is wrong here: the left
+   * sidebar, right panel, rulers, and top/bottom bars all steal space, so
+   * window-size math overestimates the canvas and off-centers the fit.
+   */
+  viewportSize: { w: number; h: number };
   // structures
   boards: Board[];
   activeBoardId: string;
@@ -434,6 +537,14 @@ interface State {
    */
   groupMeta: Record<string, { name: string; color?: string }>;
   /**
+   * Canvas-level groups — bridge sheets and board-level shapes. A canvas group
+   * exists when at least one Sheet or Shape carries its `canvasGroupId`; this
+   * array stores the per-group metadata (name) and defines the rendering order
+   * in the layers panel. Created/dissolved via the `*CanvasGroup` actions.
+   * Distinct from `groupMeta` which is shape-only.
+   */
+  canvasGroups: { id: string; name: string }[];
+  /**
    * Multi-selection of sheets. Mirrors `selectedSheetId` on single clicks;
    * populated by Shift+click or marquee when sheets are included.
    */
@@ -452,6 +563,33 @@ interface State {
   /** How sheets are laid out in the Sheets tab. "list" is the compact row
    *  default; "grid" shows each sheet as a large card with a big thumbnail. */
   sheetsViewMode: "list" | "grid";
+  /**
+   * Canvas right-click / two-finger-tap context menu. `open` gates rendering
+   * (done by the Phase-2 <ContextMenu /> component, not this phase). `target`
+   * distinguishes shape-hits ("element") from empty-board hits ("board") so
+   * the menu can show the right option set. `elementId` is the shape's id
+   * when `target === "element"`, else null.
+   *
+   * `x` / `y` are VIEWPORT coordinates (from `MouseEvent.clientX/Y`), not
+   * world coordinates — the menu renders in screen space (`position: fixed`).
+   */
+  contextMenu: {
+    open: boolean;
+    x: number;
+    y: number;
+    target: "board" | "element";
+    elementId: string | null;
+  };
+  /**
+   * Shape id whose floating `SelectionToolbar` (Duplicate/Copy/Cut/Lock/Hide/
+   * Delete) is currently visible, or null when the bar is hidden.
+   *
+   * Gated behind this field (rather than just "single shape selected") so the
+   * bar is only visible when the user explicitly triggers it via right-click
+   * or two-finger-tap — it's paired with the context menu, not the selection
+   * itself. Dismissed on Escape, mousedown outside, or board right-click.
+   */
+  selectionToolbarShapeId: string | null;
   showHamburger: boolean;
   showIterationDropdown: boolean;
   // ── Comments (spatial threads) ───────────────────────────────────────────
@@ -466,6 +604,8 @@ interface State {
   /** The "you" id. Used as authorId for new comments. */
   currentUserId: string;
   showComments: boolean;
+  /** Right rail showing the Versions panel. Mutex with showComments / showRightSidebar. */
+  showVersions: boolean;
   /** Whether the sidebar is showing the thread list or a single thread. */
   commentsView: CommentsView;
   /** Focused thread id. Invariant: null ⇔ commentsView === "list". */
@@ -529,7 +669,7 @@ interface State {
     bold: boolean;
     italic: boolean;
     underline: boolean;
-    align: "left" | "center" | "right";
+    align: "left" | "center" | "right" | "justify";
     verticalAlign?: "top" | "middle" | "bottom";
     bullets: ListStyle;
     indent: number;
@@ -550,7 +690,7 @@ interface State {
   // today; the remaining fields are persisted so the follow-up renderer can
   // pick them up without migrating stored state.
   lineRouting: LineRouting;
-  lineWeight: number;      // 0..10 world-px
+  lineWeight: number;      // 0..100 world-px
   linePattern: LinePattern;
   lineStartMarker: LineMarkerKind;
   lineEndMarker: LineMarkerKind;
@@ -558,8 +698,40 @@ interface State {
   // shape sub-tool — drives the next created ShapeShape
   shapeKind: ShapeKind;
   shapeDefaults: ShapeStyle;
-  // text-edit overlay — non-null while a shape's in-shape text is being edited
+  // text-edit overlay — non-null while a shape's in-shape text is being edited.
+  // `editingText` is the canonical state and supports both ShapeShape `text`
+  // and StickyShape `header`/`body`. `editingTextShapeId` is a back-compat
+  // alias kept in lockstep so legacy readers (sidebar/shortcut code) don't
+  // need to learn the discriminated form.
+  editingText: EditingTextTarget | null;
   editingTextShapeId: string | null;
+  /** The live Tiptap editor instance bound to the current edit overlay, or
+   *  null when no shape's text is being edited. The TextFormatBar reads this
+   *  to dispatch chain-commands (toggleBold, setColor, setFontSize, etc.) on
+   *  the active selection without prop-drilling. Non-serialisable — never
+   *  persisted, never snapshotted into history. */
+  activeRichTextEditor: TipTapEditor | null;
+  /** Non-null while an image is in crop-edit mode. Parallels editingTextShapeId. */
+  croppingImageId: string | null;
+  /** Aspect-ratio constraint active during the current crop session.
+   *  `null` = freeform (no constraint). Transient: cleared on begin/end. */
+  cropAspectRatio: number | null;
+  /** Fixed preview geometry captured at `beginImageCrop` — the natural image
+   *  drawn at the shape's begin-time pixel density, anchored relative to the
+   *  shape's (frozen) position. CropOverlay uses these constants instead of
+   *  deriving from the live `shape.width/crop.w` ratio, so the preview image
+   *  doesn't rescale while the user drags handles. `offsetX`/`offsetY` are the
+   *  preview top-left relative to the shape's top-left (always ≤ 0). Null
+   *  outside crop mode. */
+  cropSessionPreview: {
+    width: number;
+    height: number;
+    offsetX: number;
+    offsetY: number;
+  } | null;
+  /** Global toast payload. Null = no toast visible. Auto-clears ~2200ms
+   *  after `showToast` via a module-scoped timer. */
+  toast: { message: string; level: "info" | "error" } | null;
   // clipboard + history
   clipboard: ClipboardState;
   past: HistorySnapshot[];
@@ -578,6 +750,7 @@ interface State {
   setPan: (p: { x: number; y: number }) => void;
   panBy: (dx: number, dy: number) => void;
   zoomAt: (factor: number, cx: number, cy: number) => void;
+  setViewportSize: (w: number, h: number) => void;
   setActiveBoard: (id: string) => void;
   addBoard: () => void;
   duplicateBoard: () => void;
@@ -623,6 +796,9 @@ interface State {
   setViewFilter: (f: Filter) => void;
   setViewSort: (s: SortOrder) => void;
   toggleViewFavorite: (id: string) => void;
+  /** Remove a view from the sidebar list. Used by the view item's
+   *  right-click → Delete option. */
+  removeView: (id: string) => void;
   addShape: (s: Shape) => void;
   updateShape: (id: string, patch: Partial<Shape>) => void;
   deleteShape: (id: string) => void;
@@ -709,8 +885,12 @@ interface State {
   deleteThread: (id: string) => void;
   deleteComment: (id: string) => void;
   moveThread: (id: string, coordinates: { x: number; y: number }) => void;
-  /** Mutex for the right rail — Views and Comments can't both be docked. */
-  openRightPanel: (id: "views" | "comments" | null) => void;
+  /** Mutex for the right rail — Views, Comments, and Versions can't co-exist. */
+  openRightPanel: (id: "views" | "comments" | "versions" | null) => void;
+  /** Jump the document back to a specific snapshot in `past` by id.
+   *  Snapshots after the target (plus current state) become the future stack
+   *  so the restore is itself undoable. No-op if the id isn't found. */
+  restoreVersion: (id: string) => void;
   // ---- SpacePresent actions -------------------------------------------------
   /** Open the sheet-selection modal; seeds selection = every unhidden sheet. */
   startPresentation: () => void;
@@ -757,6 +937,32 @@ interface State {
   zoomToSheet: (id: string, viewportW: number, viewportH: number) => void;
   setLeftSidebarTab: (tab: "sheets" | "layers") => void;
   setSheetsViewMode: (mode: "list" | "grid") => void;
+  /**
+   * Open the canvas context menu at viewport coordinates (x, y), targeted at
+   * either a specific shape (`target: "element"` + `elementId`) or the empty
+   * board (`target: "board"`). Callers must pass `clientX` / `clientY` — world
+   * coordinates would drift with pan/zoom after open.
+   *
+   * Safe to call while the menu is already open — this replaces the location
+   * and target, matching the expectation that a second right-click relocates
+   * the menu rather than stacking.
+   */
+  openContextMenu: (args: {
+    x: number;
+    y: number;
+    target: "board" | "element";
+    elementId?: string | null;
+  }) => void;
+  /** Close the context menu. Safe to call when it's already closed. */
+  closeContextMenu: () => void;
+  /**
+   * Anchor the floating selection toolbar to a specific shape. Called from
+   * Canvas's right-click handler after it classifies the hit as an element.
+   * Idempotent — replacing the id re-anchors the bar to the new shape.
+   */
+  showSelectionToolbarFor: (id: string) => void;
+  /** Hide the selection toolbar. Safe to call when it's already hidden. */
+  hideSelectionToolbar: () => void;
   setShowRulerH: (b: boolean) => void;
   setShowRulerV: (b: boolean) => void;
   setShowRulerBoth: (b: boolean) => void;
@@ -772,7 +978,7 @@ interface State {
     bold: boolean;
     italic: boolean;
     underline: boolean;
-    align: "left" | "center" | "right";
+    align: "left" | "center" | "right" | "justify";
     verticalAlign?: "top" | "middle" | "bottom";
     bullets: ListStyle;
     indent: number;
@@ -795,10 +1001,49 @@ interface State {
   swapLineMarkers: () => void;
   setShapeKind: (k: ShapeKind) => void;
   setShapeDefaults: (patch: Partial<ShapeStyle>) => void;
-  /** Enter in-shape text-edit mode for the given shape. */
-  beginTextEdit: (id: string) => void;
+  /** Enter in-shape text-edit mode. Accepts either a bare shape id (legacy
+   *  shorthand for `{ kind: "shape", id }`) or an `EditingTextTarget` for
+   *  sticky header/body editing. */
+  beginTextEdit: (target: string | EditingTextTarget) => void;
   /** Exit text-edit mode (committed=true means the textarea wrote its value). */
   endTextEdit: () => void;
+  /** Register the live Tiptap editor for the current overlay. Called by
+   *  TextEditOverlay on mount; cleared on unmount (or set null). */
+  setActiveRichTextEditor: (editor: TipTapEditor | null) => void;
+  // ── Canvas groups (sheets + board shapes drag together) ─────────────────
+  /** Assign a fresh canvasGroupId to every member; appends a metadata entry.
+   *  Returns the new group id. No-op when both id arrays are empty. */
+  createCanvasGroup: (members: { sheetIds: string[]; shapeIds: string[] }) => string | null;
+  /** Null out canvasGroupId on every member of `id`; remove the metadata entry. */
+  dissolveCanvasGroup: (id: string) => void;
+  /** Add a sheet or shape to an existing canvas group. */
+  addToCanvasGroup: (id: string, member: { kind: "sheet" | "shape"; id: string }) => void;
+  /** Remove a sheet or shape from its canvas group (clears its canvasGroupId).
+   *  GCs the group's metadata if the last member leaves. */
+  removeFromCanvasGroup: (member: { kind: "sheet" | "shape"; id: string }) => void;
+  /** Rename a canvas group. Empty names are rejected. */
+  setCanvasGroupName: (id: string, name: string) => void;
+  /** Enter inline crop mode for the image with this id. */
+  beginImageCrop: (id: string) => void;
+  /** Exit crop mode. `commit=true` means the current draft crop on the shape's
+   *  `style.crop` is the final state; `commit=false` reverts to the crop that
+   *  existed when `beginImageCrop` was called. */
+  endImageCrop: (commit: boolean) => void;
+  /** Live-update the crop rectangle during a handle drag. Coalesced into one
+   *  history entry per crop session. */
+  setImageCrop: (id: string, crop: ImageCrop) => void;
+  /** Clear any crop and restore width/height to naturalWidth/naturalHeight. */
+  resetImageCrop: (id: string) => void;
+  /** Set the aspect-ratio constraint for the active crop session. `null`
+   *  unlocks (freeform). Non-null fits the current crop to the ratio
+   *  (keeping center), creating a crop if none exists yet. */
+  setCropAspectRatio: (ratio: number | null) => void;
+  /** Convenience setter for image style. Fills missing fields from defaults
+   *  so the first toggle doesn't have to construct a whole ImageStyle. */
+  setImageStyle: (id: string, patch: Partial<ImageStyle>) => void;
+  /** Show a toast message. Auto-clears after ~2200ms. */
+  showToast: (message: string, level?: "info" | "error") => void;
+  hideToast: () => void;
   /** Assign a new shared groupId to every shape currently in selectedShapeIds. */
   groupSelected: () => void;
   /** Clear groupId on every shape currently in selectedShapeIds. */
@@ -834,15 +1079,26 @@ interface State {
   // clipboard (shapes & sheets)
   copyShape: (id: string) => void;
   cutShape: (id: string) => void;
-  pasteShape: () => void;
+  /** Paste the single-shape clipboard. When `anchor` is provided, the pasted
+   *  shape's top-left lands at `(anchor.x, anchor.y)` inside `anchor.sheetId`
+   *  (used by the ContextMenu's "Paste" so it drops at the right-click
+   *  position). Without an anchor, falls back to the default +20/+20 nudge
+   *  from the source onto the active sheet, which is what Cmd+V still uses. */
+  pasteShape: (anchor?: { sheetId: string; x: number; y: number }) => void;
   duplicateShape: (id: string) => void;
   copySheetToClip: (id: string) => void;
   pasteSheetFromClip: () => void;
   /** Copy every currently-selected shape and sheet to clipboard.multi. */
   copyMultiToClip: (shapeIds: string[], sheetIds: string[]) => void;
   /** Paste clipboard.multi — shapes go to the active sheet with +20 offset,
-   *  sheets are appended to the row. Selects the pasted items. */
-  pasteMultiFromClip: () => void;
+   *  sheets are appended to the row. Selects the pasted items. When `anchor`
+   *  is provided, shapes are translated so the bounding-box top-left lands at
+   *  `(anchor.x, anchor.y)` inside `anchor.sheetId` (used by the ContextMenu's
+   *  "Paste"). Sheets in the clipboard are unaffected by the anchor — they
+   *  still append via `layoutSheetsRow`. */
+  pasteMultiFromClip: (
+    anchor?: { sheetId: string; x: number; y: number },
+  ) => void;
   /** Rotate every shape and sheet currently in the multi-selection by `deg`. */
   rotateSelectedBy: (deg: number) => void;
   /** Set visibility/lock flags for the whole multi-selection at once. */
@@ -880,6 +1136,66 @@ const HISTORY_LIMIT = 50;
 let coalesceKey: string | null = null;
 let coalesceFirstPushed = false;
 
+// Auto-dismiss timer for the global toast slice. Held at module scope so a
+// fresh `showToast` can cancel the previous one without racing.
+let toastTimer: number | null = null;
+
+// Pre-crop snapshots. Captured by `beginImageCrop` so Esc / Cancel can revert
+// to the exact crop (or absence of crop) + frame size the user had before
+// entering crop mode. Cleared on commit or revert.
+let imageCropOriginal: ImageCrop | null = null;
+let imageCropOriginalSize: { width: number; height: number } | null = null;
+// Snapshot of shape.x/y at crop-begin. Lets `setImageCrop` shift the shape's
+// world position so the crop rect visually tracks the chosen natural-pixel
+// region (preview stays anchored; shape follows the crop).
+let imageCropOriginalPos: { x: number; y: number } | null = null;
+// Snapshot of shape.rotation at crop-begin so Esc / Cancel can revert any
+// rotation applied during the crop session. Null outside crop mode.
+let imageCropOriginalRotation: number | null = null;
+
+// Fit a crop rect to a target aspect ratio while keeping its center and
+// clamping into the natural image bounds. To avoid "each ratio shrinks the
+// rect" pathology, we preserve the current rect's LONGER axis and grow the
+// other to match the new ratio. If that overshoots the image, we then shrink
+// proportionally to fit. The crop's center is preserved; clamping only moves
+// it (never resizes it further) when the grown rect would fall off the image.
+function fitCropToRatio(
+  c: ImageCrop,
+  r: number,
+  nw: number,
+  nh: number
+): ImageCrop {
+  const curR = c.w / c.h;
+  let newW: number;
+  let newH: number;
+  if (curR > r) {
+    // Current rect is wider than target → keep width, grow height.
+    newW = c.w;
+    newH = c.w / r;
+  } else {
+    // Current rect is taller (or equal) → keep height, grow width.
+    newH = c.h;
+    newW = c.h * r;
+  }
+  // Clamp against natural image dimensions — if either axis overshoots, rescale
+  // the rect proportionally so the ratio is preserved.
+  if (newW > nw) {
+    newW = nw;
+    newH = newW / r;
+  }
+  if (newH > nh) {
+    newH = nh;
+    newW = newH * r;
+  }
+  const cx = c.x + c.w / 2;
+  const cy = c.y + c.h / 2;
+  let newX = cx - newW / 2;
+  let newY = cy - newH / 2;
+  newX = Math.max(0, Math.min(nw - newW, newX));
+  newY = Math.max(0, Math.min(nh - newH, newY));
+  return { x: newX, y: newY, w: newW, h: newH };
+}
+
 // Helper is module-scoped so actions defined below can close over the store
 // handle via a late-bound reference. We assign it right after create() runs.
 let storeRef: {
@@ -891,7 +1207,7 @@ let storeRef: {
   ) => void;
 } | null = null;
 
-function pushHistory(): void {
+function pushHistory(label?: string): void {
   if (!storeRef) return;
   const s = storeRef.getState();
   if (coalesceKey) {
@@ -899,6 +1215,11 @@ function pushHistory(): void {
     coalesceFirstPushed = true;
   }
   const snap: HistorySnapshot = {
+    id: makeSnapshotId(),
+    timestamp: Date.now(),
+    userId: s.currentUserId,
+    label,
+    thumbnail: captureCanvasThumbnail(),
     sheets: s.sheets,
     shapes: s.shapes,
     guides: s.guides,
@@ -908,12 +1229,41 @@ function pushHistory(): void {
   storeRef.setState({ past, future: [] });
 }
 
+// Aggressively-downscaled JPEG of the live Konva stage. Returns undefined when
+// the stage isn't mounted (early init, tests). pixelRatio 0.15 + JPEG quality
+// 0.5 keeps each thumbnail well under 10KB so a full 50-snapshot stack stays
+// in the low hundreds of KB.
+function captureCanvasThumbnail(): string | undefined {
+  try {
+    const stage = (window as unknown as {
+      __spaceshow_stage?: { toDataURL: (cfg: object) => string };
+    }).__spaceshow_stage;
+    if (!stage) return undefined;
+    return stage.toDataURL({
+      pixelRatio: 0.15,
+      mimeType: "image/jpeg",
+      quality: 0.5,
+    });
+  } catch {
+    return undefined;
+  }
+}
+
+function makeSnapshotId(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `snap_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+}
+
 export const useStore = create<State>((set, get) => ({
   projectName: "Project_Name",
   presentationName: "Presentation_Name",
   tool: "select",
   zoom: 0.6,
   pan: { x: 200, y: 120 },
+  // Sensible initial; App.tsx replaces this on first ResizeObserver tick.
+  viewportSize: { w: 800, h: 600 },
 
   boards: defaultBoards,
   activeBoardId: "board_1",
@@ -926,6 +1276,7 @@ export const useStore = create<State>((set, get) => ({
   selectedSheetIds: [],
   lastAnchorShapeId: null,
   groupMeta: {},
+  canvasGroups: [],
 
   iterations: defaultIterations,
   activeIterationId: "iter_1",
@@ -936,6 +1287,14 @@ export const useStore = create<State>((set, get) => ({
   expandedSheets: { sheet_1: true },
   leftSidebarTab: "layers",
   sheetsViewMode: "list",
+  contextMenu: {
+    open: false,
+    x: 0,
+    y: 0,
+    target: "board",
+    elementId: null,
+  },
+  selectionToolbarShapeId: null,
   showHamburger: false,
   showIterationDropdown: false,
   threads: defaultThreads,
@@ -944,6 +1303,7 @@ export const useStore = create<State>((set, get) => ({
   users: defaultUsers,
   currentUserId: "user_me",
   showComments: false,
+  showVersions: false,
   commentsView: "list" as CommentsView,
   activeThreadId: null,
   hoverThreadId: null,
@@ -969,7 +1329,13 @@ export const useStore = create<State>((set, get) => ({
     pen: "#2c2a27",
     rect: "#0d9488",
     line: "#2c2a27",
-    sticky: "#fdcb6e",
+    // Sticky default = soft light yellow, matching `DEFAULT_STICKY_BG`
+    // (lib/sticky.ts) which is also the first preset in
+    // `STICKY_COLOR_SWATCHES`. The previous value (#fdcb6e — a darker
+    // orange-yellow) was a stale leftover from before the sticky redesign
+    // and made every freshly-dropped sticky look saturated instead of the
+    // canonical soft Post-it look.
+    sticky: "#fef3c7",
     text: "#2c2a27",
     shape: "#0d9488",
   },
@@ -1001,7 +1367,13 @@ export const useStore = create<State>((set, get) => ({
   lineOpacity: 1,
   shapeKind: "rectangle",
   shapeDefaults: defaultShapeStyle(),
+  editingText: null,
   editingTextShapeId: null,
+  activeRichTextEditor: null,
+  croppingImageId: null,
+  cropAspectRatio: null,
+  cropSessionPreview: null,
+  toast: null,
   showLeftSidebar: true,
   showRightSidebar: true,
   showShortcuts: false,
@@ -1028,6 +1400,14 @@ export const useStore = create<State>((set, get) => ({
     const worldY = (cy - pan.y) / zoom;
     const newPan = { x: cx - worldX * newZoom, y: cy - worldY * newZoom };
     set({ zoom: newZoom, pan: newPan });
+  },
+  // Only write when either dimension actually changes — the ResizeObserver
+  // fires on every layout tick and an unchanged write would invalidate every
+  // `useStore((s) => s.viewportSize)` subscriber for free.
+  setViewportSize: (w, h) => {
+    const cur = get().viewportSize;
+    if (cur.w === w && cur.h === h) return;
+    set({ viewportSize: { w, h } });
   },
   setActiveBoard: (id) => set({ activeBoardId: id }),
   addBoard: () =>
@@ -1058,6 +1438,37 @@ export const useStore = create<State>((set, get) => ({
     }),
   setLeftSidebarTab: (tab) => set({ leftSidebarTab: tab }),
   setSheetsViewMode: (mode) => set({ sheetsViewMode: mode }),
+  openContextMenu: ({ x, y, target, elementId = null }) =>
+    set({
+      contextMenu: {
+        open: true,
+        x,
+        y,
+        target,
+        // Only keep an elementId when the target actually is an element —
+        // prevents "board" menus from leaking a stale shape id and confusing
+        // Phase-2 renderers that switch their option list on `elementId`.
+        elementId: target === "element" ? elementId : null,
+      },
+    }),
+  closeContextMenu: () =>
+    // Short-circuit when already closed: avoids a pointless re-render for
+    // every Escape press or click-outside when the menu wasn't open.
+    set((s) =>
+      s.contextMenu.open
+        ? { contextMenu: { ...s.contextMenu, open: false } }
+        : s,
+    ),
+  showSelectionToolbarFor: (id) => set({ selectionToolbarShapeId: id }),
+  hideSelectionToolbar: () =>
+    // Same short-circuit logic as `closeContextMenu` — the outside-mousedown
+    // listener in SelectionToolbar fires on every click; bailing when already
+    // null avoids spurious re-renders.
+    set((s) =>
+      s.selectionToolbarShapeId === null
+        ? s
+        : { selectionToolbarShapeId: null },
+    ),
   setSelectedSheetIds: (ids) =>
     set({
       selectedSheetIds: ids,
@@ -1412,16 +1823,32 @@ export const useStore = create<State>((set, get) => ({
         v.id === id ? { ...v, favorite: !v.favorite } : v
       ),
     })),
+  removeView: (id) =>
+    set((s) => ({ views: s.views.filter((v) => v.id !== id) })),
   addShape: (sh) => {
+    // Sticky notes are canvas-level annotations: they always live on the
+    // "board" sentinel sheet so they render above all sheet content and are
+    // filtered out of presentation. Coerce here so the create site can't
+    // accidentally drop one inside a sheet's group.
+    const next: Shape =
+      sh.type === "sticky" && sh.sheetId !== "board"
+        ? ({ ...sh, sheetId: "board" } as Shape)
+        : sh;
     pushHistory();
-    set((s) => ({ shapes: [...s.shapes, sh] }));
+    set((s) => ({ shapes: [...s.shapes, next] }));
   },
   updateShape: (id, patch) => {
     pushHistory();
     set((s) => ({
-      shapes: s.shapes.map((sh) =>
-        sh.id === id ? ({ ...sh, ...patch } as Shape) : sh
-      ),
+      shapes: s.shapes.map((sh) => {
+        if (sh.id !== id) return sh;
+        const merged = { ...sh, ...patch } as Shape;
+        // Belt-and-braces: stickies must stay on the "board" sentinel sheet.
+        if (merged.type === "sticky" && merged.sheetId !== "board") {
+          return { ...merged, sheetId: "board" } as Shape;
+        }
+        return merged;
+      }),
     }));
   },
   deleteShape: (id) => {
@@ -1429,6 +1856,13 @@ export const useStore = create<State>((set, get) => ({
     set((s) => ({
       shapes: s.shapes.filter((sh) => sh.id !== id),
       selectedShapeId: s.selectedShapeId === id ? null : s.selectedShapeId,
+      // Clear stale ids from plural selection + floating-toolbar anchor so
+      // the transformer and SelectionToolbar don't keep pointing at the
+      // deleted node (their cleanup effects would eventually hide them,
+      // but this avoids a render with a stale reference).
+      selectedShapeIds: s.selectedShapeIds.filter((x) => x !== id),
+      selectionToolbarShapeId:
+        s.selectionToolbarShapeId === id ? null : s.selectionToolbarShapeId,
     }));
   },
   toggleShapeVisible: (id) =>
@@ -1791,12 +2225,39 @@ export const useStore = create<State>((set, get) => ({
     set({
       showComments: id === "comments",
       showRightSidebar: id === "views",
+      showVersions: id === "versions",
       // Collapsing a focused thread back to list is the friendlier default when
       // closing and re-opening — keeps users oriented in the list overview.
       ...(id !== "comments"
         ? { activeThreadId: null, commentsView: "list" as CommentsView }
         : {}),
     }),
+  restoreVersion: (id) => {
+    const s = get();
+    const idx = s.past.findIndex((snap) => snap.id === id);
+    if (idx === -1) return;
+    const target = s.past[idx];
+    // Everything strictly after the target in `past`, plus the current state,
+    // moves into `future` (oldest→newest, so redo walks forward in real order).
+    const droppedFromPast = s.past.slice(idx + 1);
+    const currentSnap: HistorySnapshot = {
+      id: makeSnapshotId(),
+      timestamp: Date.now(),
+      userId: s.currentUserId,
+      thumbnail: captureCanvasThumbnail(),
+      sheets: s.sheets,
+      shapes: s.shapes,
+      guides: s.guides,
+    };
+    const future = [...droppedFromPast, currentSnap, ...s.future];
+    set({
+      past: s.past.slice(0, idx),
+      future,
+      sheets: target.sheets,
+      shapes: target.shapes,
+      guides: target.guides ?? [],
+    });
+  },
   // ---- SpacePresent actions -------------------------------------------------
   startPresentation: () =>
     set((s) => ({
@@ -1917,7 +2378,7 @@ export const useStore = create<State>((set, get) => ({
     })),
   setLineRouting: (r) => set({ lineRouting: r }),
   setLineWeight: (w) =>
-    set({ lineWeight: Math.max(0, Math.min(10, Math.round(w * 2) / 2)) }),
+    set({ lineWeight: Math.max(0, Math.min(100, Math.round(w))) }),
   setLinePattern: (p) => set({ linePattern: p }),
   setLineStartMarker: (m) => set({ lineStartMarker: m }),
   setLineEndMarker: (m) => set({ lineEndMarker: m }),
@@ -1930,8 +2391,298 @@ export const useStore = create<State>((set, get) => ({
   setShapeKind: (k) => set({ shapeKind: k }),
   setShapeDefaults: (patch) =>
     set((s) => ({ shapeDefaults: { ...s.shapeDefaults, ...patch } })),
-  beginTextEdit: (id) => set({ editingTextShapeId: id }),
-  endTextEdit: () => set({ editingTextShapeId: null }),
+  beginTextEdit: (target) => {
+    // Accept either a bare id (legacy) or a discriminated EditingTextTarget.
+    const t: EditingTextTarget =
+      typeof target === "string" ? { kind: "shape", id: target } : target;
+    set({ editingText: t, editingTextShapeId: t.id });
+  },
+  endTextEdit: () =>
+    set({ editingText: null, editingTextShapeId: null, activeRichTextEditor: null }),
+  setActiveRichTextEditor: (editor) => set({ activeRichTextEditor: editor }),
+  createCanvasGroup: ({ sheetIds, shapeIds }) => {
+    if (sheetIds.length === 0 && shapeIds.length === 0) return null;
+    const s = get();
+    const gid = uid("cgrp");
+    const nextNumber = s.canvasGroups.length + 1;
+    const sheetSet = new Set(sheetIds);
+    const shapeSet = new Set(shapeIds);
+    pushHistory();
+    set({
+      sheets: s.sheets.map((sh) =>
+        sheetSet.has(sh.id) ? { ...sh, canvasGroupId: gid } : sh
+      ),
+      shapes: s.shapes.map((sh) =>
+        shapeSet.has(sh.id) ? ({ ...sh, canvasGroupId: gid } as Shape) : sh
+      ),
+      canvasGroups: [
+        ...s.canvasGroups,
+        { id: gid, name: `Canvas group ${nextNumber}` },
+      ],
+    });
+    return gid;
+  },
+  dissolveCanvasGroup: (id) => {
+    const s = get();
+    pushHistory();
+    set({
+      sheets: s.sheets.map((sh) =>
+        sh.canvasGroupId === id ? { ...sh, canvasGroupId: null } : sh
+      ),
+      shapes: s.shapes.map((sh) =>
+        sh.canvasGroupId === id ? ({ ...sh, canvasGroupId: null } as Shape) : sh
+      ),
+      canvasGroups: s.canvasGroups.filter((g) => g.id !== id),
+    });
+  },
+  addToCanvasGroup: (id, member) => {
+    const s = get();
+    if (!s.canvasGroups.some((g) => g.id === id)) return;
+    pushHistory();
+    if (member.kind === "sheet") {
+      set({
+        sheets: s.sheets.map((sh) =>
+          sh.id === member.id ? { ...sh, canvasGroupId: id } : sh
+        ),
+      });
+    } else {
+      set({
+        shapes: s.shapes.map((sh) =>
+          sh.id === member.id ? ({ ...sh, canvasGroupId: id } as Shape) : sh
+        ),
+      });
+    }
+  },
+  removeFromCanvasGroup: (member) => {
+    const s = get();
+    let gidLeft: string | null = null;
+    pushHistory();
+    if (member.kind === "sheet") {
+      const sh = s.sheets.find((x) => x.id === member.id);
+      gidLeft = sh?.canvasGroupId ?? null;
+      set({
+        sheets: s.sheets.map((x) =>
+          x.id === member.id ? { ...x, canvasGroupId: null } : x
+        ),
+      });
+    } else {
+      const sh = s.shapes.find((x) => x.id === member.id);
+      gidLeft = sh?.canvasGroupId ?? null;
+      set({
+        shapes: s.shapes.map((x) =>
+          x.id === member.id ? ({ ...x, canvasGroupId: null } as Shape) : x
+        ),
+      });
+    }
+    // GC: if the group has no remaining members, drop the metadata entry.
+    if (gidLeft) {
+      const after = get();
+      const stillUsed =
+        after.sheets.some((sh) => sh.canvasGroupId === gidLeft) ||
+        after.shapes.some((sh) => sh.canvasGroupId === gidLeft);
+      if (!stillUsed) {
+        set({ canvasGroups: after.canvasGroups.filter((g) => g.id !== gidLeft) });
+      }
+    }
+  },
+  setCanvasGroupName: (id, name) => {
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    set((s) => ({
+      canvasGroups: s.canvasGroups.map((g) =>
+        g.id === id ? { ...g, name: trimmed } : g
+      ),
+    }));
+  },
+  beginImageCrop: (id) => {
+    const s = get();
+    const sh = s.shapes.find((x) => x.id === id);
+    if (!sh || sh.type !== "image") return;
+    imageCropOriginal = sh.style?.crop
+      ? { ...sh.style.crop }
+      : null;
+    imageCropOriginalSize = { width: sh.width, height: sh.height };
+    imageCropOriginalPos = { x: sh.x, y: sh.y };
+    imageCropOriginalRotation = sh.rotation ?? 0;
+    // Freeze the preview geometry at begin-time pixel density so the full
+    // natural image can be drawn behind the crop rect without rescaling as
+    // the user drags handles. scaleX/Y are this session's "pixels per
+    // natural unit" — the shape currently shows crop.w natural pixels
+    // stretched over shape.width screen units.
+    const nw = sh.naturalWidth ?? sh.width;
+    const nh = sh.naturalHeight ?? sh.height;
+    const initCrop = imageCropOriginal ?? { x: 0, y: 0, w: nw, h: nh };
+    const scaleX = sh.width / Math.max(1, initCrop.w);
+    const scaleY = sh.height / Math.max(1, initCrop.h);
+    const cropSessionPreview = {
+      width: nw * scaleX,
+      height: nh * scaleY,
+      offsetX: -initCrop.x * scaleX,
+      offsetY: -initCrop.y * scaleY,
+    };
+    coalesceKey = `crop:${id}`;
+    coalesceFirstPushed = false;
+    set({ croppingImageId: id, cropAspectRatio: null, cropSessionPreview });
+  },
+  endImageCrop: (commit) => {
+    const s = get();
+    const id = s.croppingImageId;
+    if (!id) return;
+    const sh = s.shapes.find((x) => x.id === id);
+    if (sh && sh.type === "image") {
+      if (!commit) {
+        // Cancel: restore the original crop, frame size, position, rotation.
+        const style = sh.style ?? undefined;
+        const restored =
+          style !== undefined
+            ? { ...style, crop: imageCropOriginal ?? undefined }
+            : imageCropOriginal
+            ? { ...defaultImageStyle(), crop: imageCropOriginal }
+            : undefined;
+        const restoredRotation = imageCropOriginalRotation ?? 0;
+        set({
+          shapes: s.shapes.map((x) =>
+            x.id === id
+              ? ({
+                  ...x,
+                  x: imageCropOriginalPos
+                    ? imageCropOriginalPos.x
+                    : (x as typeof sh).x,
+                  y: imageCropOriginalPos
+                    ? imageCropOriginalPos.y
+                    : (x as typeof sh).y,
+                  width: imageCropOriginalSize
+                    ? imageCropOriginalSize.width
+                    : (x as typeof sh).width,
+                  height: imageCropOriginalSize
+                    ? imageCropOriginalSize.height
+                    : (x as typeof sh).height,
+                  rotation: restoredRotation,
+                  style: restored,
+                } as Shape)
+              : x
+          ),
+        });
+      } else if (
+        imageCropOriginalSize &&
+        imageCropOriginalPos &&
+        sh.style?.crop
+      ) {
+        // Commit: shape stayed at its begin-time size during the session so
+        // the canvas image didn't jump under the cursor. Bake the final frame
+        // now by translating into the crop rect's world position and scaling
+        // the shape to the new crop at the session's pixel density.
+        const nw = sh.naturalWidth ?? sh.width;
+        const nh = sh.naturalHeight ?? sh.height;
+        const initCrop = imageCropOriginal ?? { x: 0, y: 0, w: nw, h: nh };
+        const scaleX =
+          imageCropOriginalSize.width / Math.max(1, initCrop.w);
+        const scaleY =
+          imageCropOriginalSize.height / Math.max(1, initCrop.h);
+        const finalCrop = sh.style.crop;
+        const nextX =
+          imageCropOriginalPos.x + (finalCrop.x - initCrop.x) * scaleX;
+        const nextY =
+          imageCropOriginalPos.y + (finalCrop.y - initCrop.y) * scaleY;
+        const nextW = Math.max(1, finalCrop.w * scaleX);
+        const nextH = Math.max(1, finalCrop.h * scaleY);
+        set({
+          shapes: s.shapes.map((x) =>
+            x.id === id
+              ? ({
+                  ...x,
+                  x: nextX,
+                  y: nextY,
+                  width: nextW,
+                  height: nextH,
+                } as Shape)
+              : x
+          ),
+        });
+      }
+    }
+    imageCropOriginal = null;
+    imageCropOriginalSize = null;
+    imageCropOriginalPos = null;
+    imageCropOriginalRotation = null;
+    coalesceKey = null;
+    coalesceFirstPushed = false;
+    set({
+      croppingImageId: null,
+      cropAspectRatio: null,
+      cropSessionPreview: null,
+    });
+  },
+  setImageCrop: (id, crop) => {
+    pushHistory();
+    set((s) => ({
+      shapes: s.shapes.map((sh) => {
+        if (sh.id !== id || sh.type !== "image") return sh;
+        const style = sh.style ?? defaultImageStyle();
+        return { ...sh, style: { ...style, crop } } as Shape;
+      }),
+    }));
+  },
+  resetImageCrop: (id) => {
+    pushHistory();
+    set((s) => ({
+      shapes: s.shapes.map((sh) => {
+        if (sh.id !== id || sh.type !== "image") return sh;
+        const style = sh.style;
+        const nextStyle = style ? { ...style, crop: undefined } : undefined;
+        const nw = sh.naturalWidth ?? sh.width;
+        const nh = sh.naturalHeight ?? sh.height;
+        return {
+          ...sh,
+          width: nw,
+          height: nh,
+          style: nextStyle,
+        } as Shape;
+      }),
+    }));
+  },
+  setImageStyle: (id, patch) => {
+    pushHistory();
+    set((s) => ({
+      shapes: s.shapes.map((sh) => {
+        if (sh.id !== id || sh.type !== "image") return sh;
+        const base = sh.style ?? defaultImageStyle();
+        return { ...sh, style: { ...base, ...patch } } as Shape;
+      }),
+    }));
+  },
+  setCropAspectRatio: (ratio) => {
+    const s = get();
+    const id = s.croppingImageId;
+    set({ cropAspectRatio: ratio });
+    if (!id || ratio == null) return;
+    const sh = s.shapes.find((x) => x.id === id);
+    if (!sh || sh.type !== "image") return;
+    const nw = sh.naturalWidth ?? sh.width;
+    const nh = sh.naturalHeight ?? sh.height;
+    const current = sh.style?.crop ?? { x: 0, y: 0, w: nw, h: nh };
+    const fitted = fitCropToRatio(current, ratio, nw, nh);
+    // Route through setImageCrop so history coalescing stays consistent.
+    get().setImageCrop(id, fitted);
+  },
+  showToast: (message, level = "info") => {
+    if (toastTimer !== null) {
+      clearTimeout(toastTimer);
+      toastTimer = null;
+    }
+    set({ toast: { message, level } });
+    toastTimer = window.setTimeout(() => {
+      toastTimer = null;
+      set({ toast: null });
+    }, 2200);
+  },
+  hideToast: () => {
+    if (toastTimer !== null) {
+      clearTimeout(toastTimer);
+      toastTimer = null;
+    }
+    set({ toast: null });
+  },
   groupSelected: () => {
     const s = get();
     const ids = s.selectedShapeIds;
@@ -2235,25 +2986,60 @@ export const useStore = create<State>((set, get) => ({
     const sh = s.shapes.find((x) => x.id === id);
     if (!sh) return;
     pushHistory();
+    // Drop the cut shape from every place that could still reference it.
+    // Leaving stale ids in `selectedShapeIds` leaves the transformer
+    // pointing at a deleted node; a stale `selectionToolbarShapeId` keeps
+    // the floating toolbar open over empty space until the visibility guard
+    // hides it next render. Clearing them here avoids both flickers.
     set({
       clipboard: { ...s.clipboard, shape: { ...sh } },
       shapes: s.shapes.filter((x) => x.id !== id),
       selectedShapeId: s.selectedShapeId === id ? null : s.selectedShapeId,
+      selectedShapeIds: s.selectedShapeIds.filter((x) => x !== id),
+      selectionToolbarShapeId:
+        s.selectionToolbarShapeId === id ? null : s.selectionToolbarShapeId,
     });
   },
-  pasteShape: () => {
+  pasteShape: (anchor) => {
     const s = get();
     const src = s.clipboard.shape;
     if (!src) return;
     pushHistory();
-    const copy = {
-      ...src,
-      id: uid("shape"),
-      sheetId: s.activeSheetId,
-      x: src.x + 20,
-      y: src.y + 20,
-    } as Shape;
-    set({ shapes: [...s.shapes, copy], selectedShapeId: copy.id });
+    // Two positioning modes:
+    //   • anchor provided (right-click → Paste) → drop at the cursor so the
+    //     new shape's visible top-left lands under the mouse. We translate
+    //     every geometry field of the shape by (anchor − currentTopLeft).
+    //     This is per-type-aware so lines (points[] in sheet-local coords)
+    //     and pens (Group(x,y) + local points) come out visually correct,
+    //     not just the rect/shape/sticky/image family.
+    //   • no anchor (Cmd+V / toolbar paste) → preserve historical behavior:
+    //     +20/+20 nudge relative to the source, dropped on the active sheet.
+    let copy: Shape;
+    if (anchor) {
+      const topLeft = shapeSheetLocalTopLeft(src);
+      const dx = anchor.x - topLeft.x;
+      const dy = anchor.y - topLeft.y;
+      copy = {
+        ...translateShape(src, dx, dy),
+        id: uid("shape"),
+        sheetId: anchor.sheetId,
+      } as Shape;
+    } else {
+      copy = {
+        ...translateShape(src, 20, 20),
+        id: uid("shape"),
+        sheetId: s.activeSheetId,
+      } as Shape;
+    }
+    // Same reason as `duplicateShape`: Canvas's transformer prefers
+    // `selectedShapeIds` over the singular field, so we have to replace
+    // the plural list or the highlight stays on whatever was selected
+    // before paste (typically the original copy source).
+    set({
+      shapes: [...s.shapes, copy],
+      selectedShapeId: copy.id,
+      selectedShapeIds: [copy.id],
+    });
   },
   duplicateShape: (id) => {
     const s = get();
@@ -2266,7 +3052,21 @@ export const useStore = create<State>((set, get) => ({
       x: sh.x + 20,
       y: sh.y + 20,
     } as Shape;
-    set({ shapes: [...s.shapes, copy], selectedShapeId: copy.id });
+    // Move selection + (if showing) the floating toolbar onto the duplicate so
+    // the user actually sees a change. Without this, the duplicate lands at
+    // +20/+20 under the original and the transformer / selection-toolbar stay
+    // anchored to the source, making a successful duplicate look like a no-op.
+    // We replace `selectedShapeIds` so Canvas's transformer (which prefers
+    // the plural list) highlights the new shape; `selectionToolbarShapeId`
+    // only transfers when it was already pointed at the source — if no
+    // toolbar was open (sidebar / keyboard path), we don't summon one.
+    set({
+      shapes: [...s.shapes, copy],
+      selectedShapeId: copy.id,
+      selectedShapeIds: [copy.id],
+      selectionToolbarShapeId:
+        s.selectionToolbarShapeId === id ? copy.id : s.selectionToolbarShapeId,
+    });
   },
   copySheetToClip: (id) => {
     const s = get();
@@ -2348,7 +3148,7 @@ export const useStore = create<State>((set, get) => ({
       },
     });
   },
-  pasteMultiFromClip: () => {
+  pasteMultiFromClip: (anchor) => {
     const s = get();
     const clip = s.clipboard.multi;
     if (!clip) return;
@@ -2361,15 +3161,36 @@ export const useStore = create<State>((set, get) => ({
       const gid = src.groupId;
       if (gid && !groupRemap.has(gid)) groupRemap.set(gid, uid("group"));
     }
+    // Decide the translation to apply to every pasted shape.
+    //   • anchor provided → translate the group so the group-bbox top-left
+    //     (min of each shape's VISIBLE top-left, per-type-aware so lines
+    //     contribute their `points` bbox instead of a latent `(x,y)=0`)
+    //     lands at (anchor.x, anchor.y) inside anchor.sheetId. Relative
+    //     positions between shapes are preserved.
+    //   • no anchor → historical behavior: each shape shifts +20/+20 from its
+    //     source and goes to the active sheet.
+    let dx = 20;
+    let dy = 20;
+    let targetSheetId = s.activeSheetId;
+    if (anchor && clip.shapes.length > 0) {
+      let minX = Infinity;
+      let minY = Infinity;
+      for (const sh of clip.shapes) {
+        const tl = shapeSheetLocalTopLeft(sh);
+        if (tl.x < minX) minX = tl.x;
+        if (tl.y < minY) minY = tl.y;
+      }
+      dx = anchor.x - minX;
+      dy = anchor.y - minY;
+      targetSheetId = anchor.sheetId;
+    }
     const pastedShapes: Shape[] = clip.shapes.map((src) => {
       const oldGid = src.groupId;
       const newGid = oldGid ? groupRemap.get(oldGid) ?? null : null;
       return {
-        ...src,
+        ...translateShape(src, dx, dy),
         id: uid("shape"),
-        sheetId: s.activeSheetId,
-        x: src.x + 20,
-        y: src.y + 20,
+        sheetId: targetSheetId,
         groupId: newGid,
       } as Shape;
     });
@@ -2529,7 +3350,15 @@ export const useStore = create<State>((set, get) => ({
     const prev = s.past[s.past.length - 1];
     if (!prev) return;
     const future = [
-      { sheets: s.sheets, shapes: s.shapes, guides: s.guides },
+      {
+        id: makeSnapshotId(),
+        timestamp: Date.now(),
+        userId: s.currentUserId,
+        thumbnail: captureCanvasThumbnail(),
+        sheets: s.sheets,
+        shapes: s.shapes,
+        guides: s.guides,
+      },
       ...s.future,
     ];
     set({
@@ -2546,7 +3375,15 @@ export const useStore = create<State>((set, get) => ({
     if (!next) return;
     const past = [
       ...s.past,
-      { sheets: s.sheets, shapes: s.shapes, guides: s.guides },
+      {
+        id: makeSnapshotId(),
+        timestamp: Date.now(),
+        userId: s.currentUserId,
+        thumbnail: captureCanvasThumbnail(),
+        sheets: s.sheets,
+        shapes: s.shapes,
+        guides: s.guides,
+      },
     ];
     if (past.length > HISTORY_LIMIT) past.shift();
     set({

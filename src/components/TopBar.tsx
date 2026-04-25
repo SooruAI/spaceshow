@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
-import { MessageSquare, Play, Share2 } from "lucide-react";
+import { History, MessageSquare, Play, Share2 } from "lucide-react";
 import { useStore } from "../store";
+import { AvatarStack } from "./comments/AvatarStack";
 
 // SpaceDM groups tabs as: [SpaceStory] | [SpaceSheets, SpaceDesign, SpaceModule] | [SpaceShow]
 // We mirror the same three-group layout with dividers between groups.
@@ -14,12 +15,14 @@ const TABS_RIGHT = [{ id: "show", label: "SpaceShow" }] as const;
 
 export function TopBar() {
   const showComments = useStore((s) => s.showComments);
+  const showVersions = useStore((s) => s.showVersions);
   const openRightPanel = useStore((s) => s.openRightPanel);
   const startPresentation = useStore((s) => s.startPresentation);
   const projectName = useStore((s) => s.projectName);
   const setProjectName = useStore((s) => s.setProjectName);
   const presentationName = useStore((s) => s.presentationName);
   const setPresentationName = useStore((s) => s.setPresentationName);
+  const users = useStore((s) => s.users);
 
   const [editingName, setEditingName] = useState(false);
   const [draftName, setDraftName] = useState(projectName);
@@ -155,8 +158,14 @@ export function TopBar() {
           </div>
         </div>
 
-        {/* Right: Comments + Present + Share */}
+        {/* Right: Collaborators + Comments + Present + Share + Versions */}
         <div className="ml-auto flex items-center gap-2">
+          <div
+            className="flex items-center pr-1 cursor-default"
+            title={`${users.length} collaborator${users.length === 1 ? "" : "s"}`}
+          >
+            <AvatarStack userIds={users.map((u) => u.id)} max={3} size={22} />
+          </div>
           <button
             className={`pill-btn ${showComments ? "pill-btn-accent" : ""}`}
             onClick={() => openRightPanel(showComments ? null : "comments")}
@@ -172,6 +181,13 @@ export function TopBar() {
           </button>
           <button className="pill-btn pill-btn-accent">
             <Share2 size={14} className="mr-1.5" /> Share
+          </button>
+          <button
+            className={`pill-btn ${showVersions ? "pill-btn-accent" : ""}`}
+            onClick={() => openRightPanel(showVersions ? null : "versions")}
+            title="Versions"
+          >
+            <History size={14} className="mr-1.5" /> Versions
           </button>
         </div>
       </div>

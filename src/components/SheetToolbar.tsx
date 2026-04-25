@@ -52,6 +52,7 @@ import type {
 } from "../types";
 import { PAPER_SIZES_MM, PAPER_SIZE_OPTIONS } from "../lib/paperSizes";
 import { ColorPickerPanel } from "./ColorPickerPanel";
+import { ImageOptionsBar } from "./ImageOptionsBar";
 import {
   exportSheetAsImage,
   exportSheetUnsupported,
@@ -73,16 +74,53 @@ export function SheetToolbar() {
   // Line tool has its own dedicated floating toolbar (LineToolMenu) with a
   // richer config surface — don't double up with the generic options bar.
   if (tool === "line") return null;
+  // Selected line also surfaces the LineToolMenu (it's selection-driven,
+  // not just tool-driven). Without this short-circuit the sheet options
+  // pill and the LineToolMenu would stack on top of each other whenever
+  // the user clicks a line while in the Select tool.
+  if (selectedShape && selectedShape.type === "line") return null;
+  // Stickies own their own top-center bar (`StickyFormatBar`) for both
+  // states — picking the sticky tool from the left toolbar AND selecting
+  // an existing sticky with the select tool. Bail before rendering the
+  // generic tool/sheet options pill so the two don't stack on top of each
+  // other (the previous behaviour the user reported as "old toolkit bar
+  // is appearing"). Same pattern as the `line` short-circuit just above.
+  if (tool === "sticky") return null;
+  if (selectedShape && selectedShape.type === "sticky") return null;
+  // Pen owns its own top-center bar (`PenToolMenu`) for both tool-active
+  // and pen-shape-selected states. Same short-circuit pattern as line and
+  // sticky so the generic ToolOptionsBar doesn't double up beneath it.
+  if (tool === "pen") return null;
+  if (selectedShape && selectedShape.type === "pen") return null;
+  // Shape draw tool gets a dedicated bar with fill / border / corners
+  // controls bound to `shapeDefaults`. Without this the user would land in
+  // the generic ToolOptionsBar fallback below, which has no rendering branch
+  // for "shape" (no TOOL_META entry, not in colorTools) and renders an
+  // empty pill — same pattern as pen / line / sticky above.
+  if (tool === "shape") return <ShapeToolOptionsBar />;
   if (tool !== "select") return <ToolOptionsBar />;
+  // Selection swaps the toolbar contextually: a shape selection shows
+  // ShapeOptionsBar, an image selection shows ImageOptionsBar, otherwise the
+  // sheet-level toolbar (paper size / background / margins / lock / hide /
+  // more) is shown. Each contextual bar is its own complete toolkit — they
+  // replace the sheet bar rather than stacking alongside it.
   if (selectedShape && selectedShape.type === "shape")
     return <ShapeOptionsBar />;
+  if (selectedShape && selectedShape.type === "image")
+    return <ImageOptionsBar />;
   return <SheetOptionsBar />;
 }
 
 function SheetOptionsBar() {
-  const sheet = useStore((s) =>
-    s.sheets.find((x) => x.id === s.selectedSheetId) || null
-  );
+  // Prefer the explicitly-selected sheet, but fall back to the active (i.e.
+  // currently-displayed) sheet so the toolbar is visible at startup and any
+  // other time the user hasn't single-clicked a sheet in the layers panel.
+  // Without this fallback the bar disappears on a fresh canvas because
+  // `selectedSheetId` starts null while `activeSheetId` is "sheet_1".
+  const sheet = useStore((s) => {
+    const id = s.selectedSheetId ?? s.activeSheetId;
+    return s.sheets.find((x) => x.id === id) || null;
+  });
   const addSheet = useStore((s) => s.addSheet);
   const insertSheetAfter = useStore((s) => s.insertSheetAfter);
   const duplicateSheet = useStore((s) => s.duplicateSheet);
@@ -3230,6 +3268,239 @@ type PopoverKey =
   | "size"
   | "rotation"
   | "polygon";
+
+// ── Shape draw-mode bar ─────────────────────────────────────────────────────
+//
+// Shown while the Shapes tool is active (tool === "shape") — i.e. the user
+// has picked a shape from the left toolbar but hasn't drawn one yet. Mirrors
+// the layout of `ShapeOptionsBar` (fill / border / corners / polygon-sides)
+// but reads & writes `shapeDefaults` + `shapeKind` from the store so the
+// chosen styling is applied to the NEXT shape the user drags out. Without
+// this, the generic `ToolOptionsBar` renders an empty pill for "shape"
+// because TOOL_META has no entry and `colorTools` doesn't include it.
+function ShapeToolOptionsBar() {
+  const shapeKind = useStore((s) => s.shapeKind);
+  const style = useStore((s) => s.shapeDefaults);
+  const setShapeDefaults = useStore((s) => s.setShapeDefaults);
+
+  const [open, setOpen] = useState<PopoverKey | null>(null);
+  const rootRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    function onMd(e: MouseEvent) {
+      if (rootRef.current && !rootRef.current.contains(e.target as Node)) {
+        setOpen(null);
+      }
+    }
+    if (open) document.addEventListener("mousedown", onMd);
+    return () => document.removeEventListener("mousedown", onMd);
+  }, [open]);
+
+  const isRect = shapeKind === "rectangle";
+
+  function patchStyle(p: Partial<typeof style>) {
+    setShapeDefaults(p);
+  }
+
+  return (
+    <div
+      ref={rootRef}
+      className="absolute left-1/2 -translate-x-1/2 z-20 flex items-center gap-2 px-3 panel rounded-full shadow-2xl"
+      style={{
+        top: RULER_SIZE + 8,
+        height: TOOLBAR_HEIGHT,
+        background: "var(--bg-secondary)",
+      }}
+    >
+      <div className="flex items-center gap-1.5 text-[11px] text-ink-200 whitespace-nowrap">
+        <span className="text-ink-400">
+          <Square size={13} />
+        </span>
+        <span className="font-medium">{capitalize(shapeKind)}</span>
+        <span className="text-ink-500 text-[10px]">defaults</span>
+      </div>
+
+      <Divider />
+
+      {/* Fill */}
+      <button
+        onClick={() => setOpen(open === "fill" ? null : "fill")}
+        title="Fill"
+        className={`flex items-center gap-1.5 h-7 px-2 rounded-md text-xs transition-colors ${
+          open === "fill" ? "row-active" : "hover:bg-ink-700 text-ink-200"
+        }`}
+      >
+        <Palette size={13} />
+        <span
+          className="inline-block w-3.5 h-3.5 rounded ring-1 ring-ink-700"
+          style={{ background: style.fillColor, opacity: style.fillOpacity }}
+        />
+        <ChevronDown size={11} />
+      </button>
+
+      {/* Border */}
+      <button
+        onClick={() => setOpen(open === "border" ? null : "border")}
+        title="Border"
+        className={`flex items-center gap-1.5 h-7 px-2 rounded-md text-xs transition-colors ${
+          open === "border" ? "row-active" : "hover:bg-ink-700 text-ink-200"
+        }`}
+      >
+        <span className="text-ink-300">Border</span>
+        <ChevronDown size={11} />
+      </button>
+
+      {/* Corner radius (rectangle only) */}
+      <button
+        disabled={!isRect}
+        onClick={() => isRect && setOpen(open === "corners" ? null : "corners")}
+        title={isRect ? "Corner radius" : "Corner radius (rectangle only)"}
+        className={`flex items-center gap-1.5 h-7 px-2 rounded-md text-xs transition-colors ${
+          !isRect
+            ? "opacity-40 cursor-not-allowed text-ink-300"
+            : open === "corners"
+            ? "row-active"
+            : "hover:bg-ink-700 text-ink-200"
+        }`}
+      >
+        <span>Corners</span>
+        <span className="tabular-nums">{Math.round(style.cornerRadius)}</span>
+        <ChevronDown size={11} />
+      </button>
+
+      {/* Popovers */}
+      {open === "fill" && (
+        <div
+          className="absolute top-full mt-2 left-0 z-30 panel rounded-md shadow-2xl p-3 w-64"
+          style={{ background: "var(--bg-secondary)" }}
+          onMouseDown={(e) => e.stopPropagation()}
+        >
+          <div className="text-[10px] uppercase tracking-wider text-ink-400 mb-2">
+            Fill colour
+          </div>
+          <ColorPickerPanel
+            value={style.fillColor}
+            onChange={(c) => patchStyle({ fillColor: c })}
+          />
+          <div className="mt-3 flex items-center gap-2">
+            <span className="text-[10px] uppercase tracking-wider text-ink-400 w-16">
+              Opacity
+            </span>
+            <input
+              type="range"
+              min={0}
+              max={100}
+              step={1}
+              value={Math.round(style.fillOpacity * 100)}
+              onChange={(e) =>
+                patchStyle({ fillOpacity: Number(e.target.value) / 100 })
+              }
+              className="flex-1 accent-brand-500"
+            />
+            <span className="text-[11px] text-ink-200 tabular-nums w-9 text-right">
+              {Math.round(style.fillOpacity * 100)}%
+            </span>
+          </div>
+        </div>
+      )}
+
+      {open === "border" && (
+        <div
+          className="absolute top-full mt-2 left-0 z-30 panel rounded-md shadow-2xl p-3 w-72"
+          style={{ background: "var(--bg-secondary)" }}
+          onMouseDown={(e) => e.stopPropagation()}
+        >
+          <div className="flex items-center justify-between mb-2">
+            <span className="text-[10px] uppercase tracking-wider text-ink-400">
+              Border
+            </span>
+            <Switch
+              checked={style.borderEnabled}
+              onChange={(b) => patchStyle({ borderEnabled: b })}
+            />
+          </div>
+          <div className="flex items-center gap-2 mb-2">
+            <span className="text-[10px] uppercase tracking-wider text-ink-400 w-16">
+              Weight
+            </span>
+            <input
+              type="range"
+              min={1}
+              max={20}
+              step={1}
+              value={style.borderWeight}
+              onChange={(e) =>
+                patchStyle({ borderWeight: Number(e.target.value) })
+              }
+              disabled={!style.borderEnabled}
+              className="flex-1 accent-brand-500 disabled:opacity-50"
+            />
+            <span className="text-[11px] text-ink-200 tabular-nums w-7 text-right">
+              {style.borderWeight}px
+            </span>
+          </div>
+          <div className="mb-3">
+            <span className="text-[10px] uppercase tracking-wider text-ink-400 block mb-1">
+              Style
+            </span>
+            <div className="flex gap-1">
+              {(["solid", "dashed", "dotted", "double"] as LineStyle[]).map(
+                (st) => (
+                  <button
+                    key={st}
+                    disabled={!style.borderEnabled}
+                    onClick={() => patchStyle({ borderStyle: st })}
+                    className={`flex-1 h-7 px-1 rounded grid place-items-center text-[10px] transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
+                      style.borderStyle === st
+                        ? "row-active"
+                        : "hover:bg-ink-700 text-ink-200"
+                    }`}
+                  >
+                    <StyleGlyph style={st} />
+                  </button>
+                )
+              )}
+            </div>
+          </div>
+          <div className="text-[10px] uppercase tracking-wider text-ink-400 mb-1">
+            Colour
+          </div>
+          <ColorPickerPanel
+            value={style.borderColor}
+            onChange={(c) => patchStyle({ borderColor: c })}
+          />
+        </div>
+      )}
+
+      {open === "corners" && isRect && (
+        <div
+          className="absolute top-full mt-2 left-0 z-30 panel rounded-md shadow-2xl p-3 w-56"
+          style={{ background: "var(--bg-secondary)" }}
+          onMouseDown={(e) => e.stopPropagation()}
+        >
+          <div className="text-[10px] uppercase tracking-wider text-ink-400 mb-2">
+            Corner radius
+          </div>
+          <div className="flex items-center gap-2">
+            <input
+              type="range"
+              min={0}
+              max={64}
+              step={1}
+              value={style.cornerRadius}
+              onChange={(e) =>
+                patchStyle({ cornerRadius: Number(e.target.value) })
+              }
+              className="flex-1 accent-brand-500"
+            />
+            <span className="text-[11px] text-ink-200 tabular-nums w-7 text-right">
+              {Math.round(style.cornerRadius)}
+            </span>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
 
 function ShapeOptionsBar() {
   const editingTextShapeId = useStore((s) => s.editingTextShapeId);
